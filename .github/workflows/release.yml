@@ -1,0 +1,187 @@
+name: Release
+
+# Builds, signs, notarizes, and publishes Baby for a v* tag.
+#
+# GitHub Releases hold the versioned ZIP the in-app updater installs.
+# GitHub Pages holds update.json, the signed feed Baby reads, deployed only
+# after the release's ZIP downloads and verifies against it.
+#
+# Repository secrets (names match the github-deployment-secrets helper):
+#   MACOS_CERTIFICATE_P12_BASE64  Developer ID Application certificate and
+#                                 private key, base64-encoded P12
+#   MACOS_CERTIFICATE_PASSWORD    password of that P12
+#   APPLE_ID                      Apple Account that notarizes
+#   APPLE_TEAM_ID                 Developer team ID
+#   APPLE_APP_SPECIFIC_PASSWORD   app-specific password of that account
+#   SPARKLE_EDDSA_PRIVATE_KEY     base64 Ed25519 seed whose public key is
+#                                 UpdateConfig.publicKey; signs update.json
+#
+# GitHub Pages must use "GitHub Actions" as its source.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: xcode-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate required secrets
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          SPARKLE_EDDSA_PRIVATE_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+        run: |
+          missing=0
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
+            APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD \
+            SPARKLE_EDDSA_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::secret ${name} is not set" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Set version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+
+      - name: Test
+        run: swift test
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain_path="${RUNNER_TEMP}/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+
+          base64 --decode <<<"${CERTIFICATE_P12}" >"${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" \
+            -P "${CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 \
+            -k "${keychain_path}"
+          rm "${RUNNER_TEMP}/certificate.p12"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${keychain_password}" "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" login.keychain-db
+
+      - name: Build, sign, notarize, and package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./release.sh
+
+      - name: Sign the update feed
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+          SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+        run: |
+          zip="Baby-${VERSION}-macos-arm64.zip"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          minimum_os="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+            Resources/Info.plist)"
+          mkdir -p _site
+          build/baby-update-tool sign-feed \
+            --version "${VERSION}" --build "${BUILD}" \
+            --minimum-os "${minimum_os}" \
+            --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --zip "build/${zip}" --zip-url "${base}/${zip}" \
+            --out _site/update.json <<<"${SIGNING_KEY}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          # a rerun must not change bytes an installed client already trusts
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: build/Baby-${{ steps.version.outputs.version }}-macos-arm64.zip
+
+      # the feed goes live only once the published ZIP is the signed one,
+      # fetched through the app's own transport and URL policy
+      - name: Verify the published ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if build/baby-update-tool verify-feed _site/update.json \
+              --version "${VERSION}" --build "${BUILD}" --download; then
+              exit 0
+            fi
+            echo "verification attempt ${attempt} failed; retrying" >&2
+            sleep 15
+          done
+          echo "::error::the published ZIP does not match the signed feed"
+          exit 1
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Delete temporary keychain
+        if: always()
+        run: |
+          keychain_path="${RUNNER_TEMP}/signing.keychain-db"
+          if [[ -f "${keychain_path}" ]] && ! security delete-keychain "${keychain_path}"; then
+            echo "::warning::failed to delete ${keychain_path}"
+          fi
+
+  deploy-feed:
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: published
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Verify the public feed
+        run: |
+          mkdir site
+          tar -xf published/artifact.tar -C site
+          for attempt in $(seq 12); do
+            if curl -fsSL -H 'Cache-Control: no-cache' \
+              "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json" \
+              -o live.json && cmp -s live.json site/update.json; then
+              exit 0
+            fi
+            echo "feed not live yet (attempt ${attempt})" >&2
+            sleep 5
+          done
+          echo "::error::the public feed differs from the deployed one"
+          exit 1
