@@ -2,7 +2,8 @@ name: Release
 
 # Builds, signs, notarizes, and publishes Baby for a v* tag.
 #
-# GitHub Releases hold the versioned ZIP the in-app updater installs.
+# GitHub Releases hold a DMG for manual installation and the versioned ZIP
+# the in-app updater installs.
 # GitHub Pages holds update.json, the signed feed Baby reads, deployed only
 # after the release's ZIP downloads and verifies against it.
 #
@@ -66,6 +67,11 @@ jobs:
       - name: Test
         run: swift test
 
+      - name: Set up DMG packaging
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: false
+
       - name: Import signing certificate
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -121,7 +127,9 @@ jobs:
           overwrite_files: false
           fail_on_unmatched_files: true
           generate_release_notes: true
-          files: build/Baby-${{ steps.version.outputs.version }}-macos-arm64.zip
+          files: |
+            build/Baby-${{ steps.version.outputs.version }}-macos-arm64.zip
+            build/Baby-${{ steps.version.outputs.version }}-macos-arm64.dmg
 
       # the feed goes live only once the published ZIP is the signed one,
       # fetched through the app's own transport and URL policy

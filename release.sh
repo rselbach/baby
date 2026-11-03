@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds a release Baby.app with build.sh, notarizes and staples it, and
-# packages it as build/Baby-<version>-macos-arm64.zip, the archive the
-# in-app updater installs. The ZIP is unpacked and checked the way the
-# updater checks it.
+# packages it as build/Baby-<version>-macos-arm64.zip for the in-app updater
+# and a signed, notarized DMG for manual installation. The ZIP is unpacked
+# and checked the way the updater checks it.
 #
-# Needs VERSION and BUILD. Notarization authenticates with APPLE_ID,
+# Needs uv, VERSION, and BUILD. Notarization authenticates with APPLE_ID,
 # APPLE_TEAM_ID, and APPLE_APP_PASSWORD when all are set, else with the
 # notarytool keychain profile NOTARY_PROFILE (default "baby-notary").
 #
@@ -38,14 +38,14 @@ uses_apple_id() {
 
 # the submission's status decides, not notarytool's exit code
 notarize() {
-  local submission="${STAGING}/Baby-notarize.zip"
+  local submission="$1"
+  local target="$2"
   local result="${STAGING}/notary.json"
   local auth=(--keychain-profile "${NOTARY_PROFILE:-baby-notary}")
   if uses_apple_id; then
     auth=(--apple-id "${APPLE_ID}" --team-id "${APPLE_TEAM_ID}"
       --password "${APPLE_APP_PASSWORD}")
   fi
-  ditto -c -k --keepParent "${APP}" "${submission}"
   if ! xcrun notarytool submit "${submission}" "${auth[@]}" --wait \
     --output-format json >"${result}"; then
     echo "notarytool submit failed" >&2
@@ -63,8 +63,29 @@ notarize() {
     xcrun notarytool log "${id}" "${auth[@]}" >&2 || true
     exit 1
   fi
-  xcrun stapler staple "${APP}"
-  xcrun stapler validate "${APP}"
+  xcrun stapler staple "${target}"
+  xcrun stapler validate "${target}"
+}
+
+package_dmg() {
+  local dmg="$1"
+  local notarized="$2"
+  local authority="$3"
+  local artwork="${ROOT}/Resources/DMG/background.png"
+  sips -z 512 768 "${artwork}" --out "${STAGING}/background.png" >/dev/null
+  sips -s dpiWidth 144 -s dpiHeight 144 "${artwork}" \
+    --out "${STAGING}/background@2x.png" >/dev/null
+  tiffutil -cathidpicheck "${STAGING}/background.png" \
+    "${STAGING}/background@2x.png" -out "${STAGING}/background.tiff"
+  uv tool run --from dmgbuild==1.6.7 dmgbuild \
+    -s "${ROOT}/Resources/DMG/settings.py" -D "app=${APP}" \
+    -D "background=${STAGING}/background.tiff" Baby "${dmg}"
+  if [[ "${notarized}" == "true" ]]; then
+    codesign --sign "${authority}" --timestamp "${dmg}"
+    codesign --verify --strict "${dmg}"
+    notarize "${dmg}" "${dmg}"
+  fi
+  hdiutil verify "${dmg}"
 }
 
 # unpacks the ZIP the way the updater does and checks what it checks
@@ -112,7 +133,9 @@ main() {
     if [[ "${authority}" != "Developer ID Application:"* ]]; then
       die "Baby.app is not signed with a Developer ID Application identity"
     fi
-    notarize
+    local submission="${STAGING}/Baby-notarize.zip"
+    ditto -c -k --keepParent "${APP}" "${submission}"
+    notarize "${submission}" "${APP}"
   fi
 
   swift build -c release --package-path "${ROOT}" --product baby-update-tool
@@ -122,8 +145,11 @@ main() {
   rm -f "${zip}"
   ditto -c -k --sequesterRsrc --keepParent "${APP}" "${zip}"
   verify_zip "${zip}" "${notarized}" "${bin_dir}/baby-update-tool"
+  local dmg="${ROOT}/build/Baby-${VERSION}-macos-arm64.dmg"
+  package_dmg "${dmg}" "${notarized}" "${authority}"
   cp "${bin_dir}/baby-update-tool" "${ROOT}/build/baby-update-tool"
   echo "built ${zip}"
+  echo "built ${dmg}"
 }
 
 main "$@"
