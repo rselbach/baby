@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds Baby.app into ./build from the Swift package and PNG artwork.
+# Builds Baby.app into ./build from the Swift package and PNG artwork, with
+# the baby command line tool in Contents/Helpers.
 # Signs with our team's "Developer ID Application" identity when the keychain
 # has one, otherwise ad hoc; override with SIGNING_IDENTITY. VERSION and BUILD,
 # when set, replace CFBundleShortVersionString and CFBundleVersion.
@@ -11,6 +12,7 @@ readonly APP="${ROOT}/build/Baby.app"
 readonly PLIST="${ROOT}/Resources/Info.plist"
 readonly DEVELOPER_ID="Developer ID Application"
 readonly TEAM_ID="LS8YD2TR79"
+readonly CLI_IDENTIFIER="com.rselbach.baby.cli"
 
 signing_identity() {
   if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
@@ -28,16 +30,17 @@ signing_identity() {
   echo "-"
 }
 
-# build_binary records the real SDK version: SwiftPM otherwise records the
-# deployment target as the SDK, and newer macOS would run Baby in
-# compatibility mode. Kept out of command substitutions, which would ignore
-# a failed build.
+# build_binary builds a product and records the real SDK version: SwiftPM
+# otherwise records the deployment target as the SDK, and newer macOS would
+# run Baby in compatibility mode. Kept out of command substitutions, which
+# would ignore a failed build.
 build_binary() {
+  local product="$1"
   local minimum
   local sdk
   minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${PLIST}")"
   sdk="$(xcrun --sdk macosx --show-sdk-version)"
-  swift build -c release --package-path "${ROOT}" --arch arm64 --product Baby \
+  swift build -c release --package-path "${ROOT}" --arch arm64 --product "${product}" \
     -Xlinker -platform_version -Xlinker macos \
     -Xlinker "${minimum}" -Xlinker "${sdk}"
 }
@@ -70,6 +73,9 @@ sign() {
   else
     flags+=(--timestamp)
   fi
+  # nested code is signed first; the app's signature seals it
+  codesign "${flags[@]}" --identifier "${CLI_IDENTIFIER}" \
+    "${APP}/Contents/Helpers/baby"
   codesign "${flags[@]}" "${APP}"
   codesign --verify --deep --strict "${APP}"
 }
@@ -102,14 +108,19 @@ make_status_images() {
 }
 
 main() {
-  build_binary
+  build_binary Baby
+  build_binary BabyCLI
   local bin_dir
   bin_dir="$(swift build -c release --package-path "${ROOT}" --arch arm64 \
     --show-bin-path)"
 
   rm -rf "${APP}"
-  mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+  mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Helpers" \
+    "${APP}/Contents/Resources"
   cp "${bin_dir}/Baby" "${APP}/Contents/MacOS/Baby"
+  # not in MacOS, where "baby" would collide with "Baby" on
+  # case-insensitive volumes
+  cp "${bin_dir}/BabyCLI" "${APP}/Contents/Helpers/baby"
   cp "${PLIST}" "${APP}/Contents/Info.plist"
   stamp_version "${APP}/Contents/Info.plist"
   make_icon

@@ -21,6 +21,8 @@ struct SettingsView: View {
   @State private var loginStatus = SMAppService.mainApp.status
   @State private var loginError: String?
   @State private var presetMinutes = ""
+  @State private var toolInstalled = false
+  @State private var toolError: String?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 20) {
@@ -48,6 +50,10 @@ struct SettingsView: View {
         isOn: $activateOnLaunch)
       Divider()
       presetEditor
+      if let helper = CommandLineTool.helper {
+        Divider()
+        commandLineTool(helper)
+      }
       if let updater {
         Divider()
         updates(updater)
@@ -135,6 +141,39 @@ struct SettingsView: View {
     guard let minutes = minutesToAdd else { return }
     presets.add(minutes: minutes)
     presetMinutes = ""
+  }
+
+  private func commandLineTool(_ helper: URL) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Command line tool")
+        .font(.headline)
+      Text("Lets agents and scripts keep your Mac awake, as in `baby run make test`.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      HStack {
+        Button("Install") {
+          do {
+            try CommandLineTool.install(helper)
+            toolError = nil
+          } catch {
+            toolError = error.localizedDescription
+          }
+          toolInstalled = CommandLineTool.isInstalled(helper)
+        }
+        .disabled(toolInstalled)
+        Text(toolInstalled ? "Installed in ~/.local/bin" : "Adds baby to ~/.local/bin")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+      }
+      if let toolError {
+        Text(toolError)
+          .font(.callout)
+          .foregroundStyle(.red)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .onAppear { toolInstalled = CommandLineTool.isInstalled(helper) }
   }
 
   private func updates(_ updater: Updater) -> some View {
