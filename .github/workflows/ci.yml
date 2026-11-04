@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Test
+        run: swift test
+
+      - name: Build app bundle
+        env:
+          SIGNING_IDENTITY: '-'
+          VERSION: 0.0.0
+          BUILD: '1'
+        run: ./build.sh

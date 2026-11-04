@@ -97,6 +97,39 @@ private func exitedPID() throws -> pid_t {
   #expect(try String(contentsOf: unpacked, encoding: .utf8) == "Troy Barnes")
 }
 
+@Test func removesReadOnlyRootFolder() throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let lockedRoot = root.appending(path: "locked-stage")
+  try FileManager.default.createDirectory(
+    at: lockedRoot.appending(path: "Baby.app"), withIntermediateDirectories: true)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o500], ofItemAtPath: lockedRoot.path)
+
+  Installer.remove(lockedRoot)
+  #expect(!FileManager.default.fileExists(atPath: lockedRoot.path))
+}
+
+@Test func closesExtraFileDescriptorsInWaiter() async throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let leakedFile = root.appending(path: "secret")
+  try Data("secret".utf8).write(to: leakedFile)
+  let fd = open(leakedFile.path, O_RDONLY)
+  #expect(fd >= 3)
+  defer { close(fd) }
+  _ = fcntl(fd, F_SETFD, 0)
+
+  let out = root.appending(path: "result")
+  try Installer.runAfterExit(
+    of: try exitedPID(),
+    ["/bin/sh", "-c", "if (exec <&\"$1\") 2>/dev/null; then echo leaked; else echo closed; fi >\"$2\"", "probe", String(fd), out.path])
+  for _ in 0..<50 where !FileManager.default.fileExists(atPath: out.path) {
+    try await Task.sleep(for: .milliseconds(50))
+  }
+  #expect(try String(contentsOf: out, encoding: .utf8) == "closed\n")
+}
+
 @Test func rejectsCorruptArchives() async throws {
   let root = try temporaryFolder()
   defer { Installer.remove(root) }

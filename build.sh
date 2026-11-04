@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds Baby.app into ./build from the Swift package and PNG artwork.
-# Signs with the "Developer ID Application" identity when the keychain has
-# one, otherwise ad hoc; override with SIGNING_IDENTITY. VERSION and BUILD,
+# Signs with our team's "Developer ID Application" identity when the keychain
+# has one, otherwise ad hoc; override with SIGNING_IDENTITY. VERSION and BUILD,
 # when set, replace CFBundleShortVersionString and CFBundleVersion.
 set -euo pipefail
 
@@ -10,16 +10,19 @@ readonly ROOT
 readonly APP="${ROOT}/build/Baby.app"
 readonly PLIST="${ROOT}/Resources/Info.plist"
 readonly DEVELOPER_ID="Developer ID Application"
+readonly TEAM_ID="LS8YD2TR79"
 
 signing_identity() {
   if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
     echo "${SIGNING_IDENTITY}"
     return
   fi
-  local identities
-  identities="$(security find-identity -v -p codesigning)"
-  if grep -q "\"${DEVELOPER_ID}" <<<"${identities}"; then
-    echo "${DEVELOPER_ID}"
+  local sha1
+  sha1="$(security find-identity -v -p codesigning \
+    | sed -n "s/^[[:space:]]*[0-9][0-9]*)[[:space:]]*\([0-9A-F]\{40\}\)[[:space:]]*\"${DEVELOPER_ID}: .* (${TEAM_ID})\".*/\1/p" \
+    | head -n 1)"
+  if [[ -n "${sha1}" ]]; then
+    echo "${sha1}"
     return
   fi
   echo "-"
@@ -42,10 +45,18 @@ build_binary() {
 stamp_version() {
   local plist="$1"
   if [[ -n "${VERSION:-}" ]]; then
+    if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9.+-]{0,63}$ ]]; then
+      echo "error: VERSION must match [0-9][A-Za-z0-9.+-]{0,63}" >&2
+      exit 1
+    fi
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" \
       "${plist}"
   fi
   if [[ -n "${BUILD:-}" ]]; then
+    if [[ ! "${BUILD}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "error: BUILD must be a positive integer" >&2
+      exit 1
+    fi
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD}" "${plist}"
   fi
 }
@@ -54,7 +65,7 @@ sign() {
   local identity="$1"
   local flags=(--force --options runtime --sign "${identity}")
   if [[ "${identity}" == "-" ]]; then
-    echo "no ${DEVELOPER_ID} identity; signing ad hoc" >&2
+    echo "no ${DEVELOPER_ID} (${TEAM_ID}) identity; signing ad hoc" >&2
     flags+=(--timestamp=none)
   else
     flags+=(--timestamp)

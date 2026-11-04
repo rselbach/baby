@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
@@ -8,6 +8,6 @@ let package = Package(
     .target(name: "BabyUpdate"),
     .executableTarget(name: "Baby", dependencies: ["BabyUpdate"]),
     .executableTarget(name: "baby-update-tool", dependencies: ["BabyUpdate"]),
-    .testTarget(name: "BabyUpdateTests", dependencies: ["BabyUpdate"]),
+    .testTarget(name: "BabyUpdateTests", dependencies: ["BabyUpdate", "baby-update-tool"]),
   ]
 )

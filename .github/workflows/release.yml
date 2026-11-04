@@ -1,6 +1,6 @@
 name: Release
 
-# Builds, signs, notarizes, and publishes Baby for a v* tag.
+# Builds, signs, notarizes, and publishes Baby for a stable vX.Y.Z tag.
 #
 # GitHub Releases hold a DMG for manual installation and the versioned ZIP
 # the in-app updater installs.
@@ -24,10 +24,7 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
+permissions: {}
 
 concurrency:
   group: release
@@ -36,9 +33,12 @@ concurrency:
 jobs:
   release:
     runs-on: xcode-27
+    timeout-minutes: 60
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Validate required secrets
         env:
@@ -62,17 +62,103 @@ jobs:
 
       - name: Set version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not a stable vX.Y.Z version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
 
       - name: Test
         run: swift test
 
-      - name: Set up DMG packaging
-        uses: astral-sh/setup-uv@v9
+      - name: Fetch live feed
+        id: live
+        run: |
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json"
+          code="$(curl -sSL -H 'Cache-Control: no-cache' -o "${RUNNER_TEMP}/live.json" \
+            -w '%{http_code}' "${url}")"
+          case "${code}" in
+            200) echo "path=${RUNNER_TEMP}/live.json" >>"${GITHUB_OUTPUT}" ;;
+            404) rm -f "${RUNNER_TEMP}/live.json" ;;
+            *)
+              echo "::error::fetching ${url} failed with HTTP ${code}" >&2
+              exit 1
+              ;;
+          esac
+
+      # install Python packaging dependencies before importing signing keys
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: false
 
+      - name: Install DMG packaging tools
+        id: dmgbuild
+        run: |
+          venv="${RUNNER_TEMP}/dmgbuild"
+          uv venv "${venv}"
+          uv pip install --python "${venv}" --require-hashes --no-deps \
+            -r Resources/DMG/requirements.txt
+          echo "bin=${venv}/bin/dmgbuild" >>"${GITHUB_OUTPUT}"
+
+      # if an earlier attempt already published assets for this tag, verify and
+      # reuse them instead of rebuilding new signatures with different hashes
+      - name: Check existing release assets
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          swift build -c release --product baby-update-tool
+          bin_dir="$(swift build -c release --show-bin-path)"
+          mkdir -p build
+          cp "${bin_dir}/baby-update-tool" build/baby-update-tool
+
+          zip="Baby-${VERSION}-macos-arm64.zip"
+          dmg="Baby-${VERSION}-macos-arm64.dmg"
+          existing_dir="${RUNNER_TEMP}/existing-release"
+          mkdir -p "${existing_dir}"
+          gh release download "${GITHUB_REF_NAME}" --dir "${existing_dir}" \
+            --pattern "${zip}" --pattern "${dmg}" 2>/dev/null || true
+
+          has_zip="false"
+          if [[ -f "${existing_dir}/${zip}" ]]; then
+            unpacked="${RUNNER_TEMP}/existing-unpacked"
+            mkdir -p "${unpacked}"
+            ditto -x -k "${existing_dir}/${zip}" "${unpacked}"
+            build/baby-update-tool verify-app "${unpacked}/Baby.app" \
+              --version "${VERSION}" --build "${BUILD}"
+            xcrun stapler validate "${unpacked}/Baby.app"
+            spctl --assess --type execute --verbose=2 "${unpacked}/Baby.app"
+            rm -rf "${unpacked}"
+            has_zip="true"
+          fi
+
+          has_dmg="false"
+          if [[ -f "${existing_dir}/${dmg}" ]]; then
+            codesign --verify --strict "${existing_dir}/${dmg}"
+            xcrun stapler validate "${existing_dir}/${dmg}"
+            hdiutil verify "${existing_dir}/${dmg}"
+            has_dmg="true"
+          fi
+
+          if [[ "${has_zip}" == "true" && "${has_dmg}" == "true" ]]; then
+            cp "${existing_dir}/${zip}" "build/${zip}"
+            cp "${existing_dir}/${dmg}" "build/${dmg}"
+            echo "complete=true" >>"${GITHUB_OUTPUT}"
+          else
+            {
+              echo "complete=false"
+              echo "zip_path=${existing_dir}/${zip}"
+              echo "has_zip=${has_zip}"
+            } >>"${GITHUB_OUTPUT}"
+          fi
+
       - name: Import signing certificate
+        if: steps.existing.outputs.complete != 'true'
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -94,34 +180,52 @@ jobs:
           security list-keychains -d user -s "${keychain_path}" login.keychain-db
 
       - name: Build, sign, notarize, and package
+        if: steps.existing.outputs.complete != 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ github.run_number }}
+          DMGBUILD: ${{ steps.dmgbuild.outputs.bin }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: ./release.sh
+          HAS_EXISTING_ZIP: ${{ steps.existing.outputs.has_zip }}
+          EXISTING_ZIP: ${{ steps.existing.outputs.zip_path }}
+        run: |
+          ./release.sh
+          if [[ "${HAS_EXISTING_ZIP}" == "true" ]]; then
+            cp "${EXISTING_ZIP}" "build/Baby-${VERSION}-macos-arm64.zip"
+          fi
 
       - name: Sign the update feed
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ github.run_number }}
           SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+          LIVE_FEED: ${{ steps.live.outputs.path }}
         run: |
           zip="Baby-${VERSION}-macos-arm64.zip"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
           minimum_os="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
             Resources/Info.plist)"
+          after_args=()
+          if [[ -n "${LIVE_FEED}" ]]; then
+            after_args=(--after "${LIVE_FEED}")
+          fi
           mkdir -p _site
           build/baby-update-tool sign-feed \
             --version "${VERSION}" --build "${BUILD}" \
             --minimum-os "${minimum_os}" \
             --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
             --zip "build/${zip}" --zip-url "${base}/${zip}" \
+            ${after_args[@]+"${after_args[@]}"} \
             --out _site/update.json <<<"${SIGNING_KEY}"
+          if [[ -n "${LIVE_FEED}" ]]; then
+            build/baby-update-tool verify-feed _site/update.json --after "${LIVE_FEED}"
+          fi
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        if: steps.existing.outputs.complete != 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # a rerun must not change bytes an installed client already trusts
           overwrite_files: false
@@ -137,10 +241,16 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ github.run_number }}
+          LIVE_FEED: ${{ steps.live.outputs.path }}
         run: |
+          after_args=()
+          if [[ -n "${LIVE_FEED}" ]]; then
+            after_args=(--after "${LIVE_FEED}")
+          fi
           for attempt in 1 2 3 4 5; do
             if build/baby-update-tool verify-feed _site/update.json \
-              --version "${VERSION}" --build "${BUILD}" --download; then
+              --version "${VERSION}" --build "${BUILD}" \
+              ${after_args[@]+"${after_args[@]}"} --download; then
               exit 0
             fi
             echo "verification attempt ${attempt} failed; retrying" >&2
@@ -150,7 +260,7 @@ jobs:
           exit 1
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: _site
 
@@ -165,23 +275,62 @@ jobs:
   deploy-feed:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: github-pages
           path: published
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Verify the public feed
+      # refuse to overwrite a newer live feed when an older run is redeployed
+      - name: Check live feed monotonicity
         run: |
           mkdir site
           tar -xf published/artifact.tar -C site
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json"
+          code="$(curl -sSL -H 'Cache-Control: no-cache' -o current.json \
+            -w '%{http_code}' "${url}")"
+          case "${code}" in
+            404) exit 0 ;;
+            200) ;;
+            *)
+              echo "::error::fetching ${url} failed with HTTP ${code}" >&2
+              exit 1
+              ;;
+          esac
+          python3 - current.json site/update.json <<'PY'
+          import base64, json, sys
+
+          def load(path):
+            raw = open(path, "rb").read()
+            env = json.loads(raw)
+            rel = json.loads(base64.b64decode(env["payload"]))
+            parts = [int(p) for p in rel["version"].split(".")]
+            ver = tuple(parts + [0] * (3 - len(parts)))
+            return raw, rel, ver
+
+          cur_raw, cur, cur_ver = load(sys.argv[1])
+          new_raw, new, new_ver = load(sys.argv[2])
+          if new_raw == cur_raw or new == cur:
+            sys.exit(0)
+          if new["build"] <= cur["build"]:
+            sys.exit(f"refusing build {new['build']} <= live build {cur['build']}")
+          if new_ver < cur_ver:
+            sys.exit(f"refusing version {new['version']} < live version {cur['version']}")
+          PY
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Verify the public feed
+        run: |
           for attempt in $(seq 12); do
             if curl -fsSL -H 'Cache-Control: no-cache' \
               "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json" \

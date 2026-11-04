@@ -65,9 +65,16 @@ private func encode(_ envelope: [String: String]) throws -> Data {
   }
 }
 
+@Test func acceptsFractionalSecondTimestamps() throws {
+  var r = release()
+  r.publishedAt = "2026-11-03T12:00:00.123Z"
+  let feed = try Feed.seal(r, privateKey: key)
+  #expect(try Feed.open(feed, publicKey: key.publicKey) == r)
+}
+
 @Test(arguments: [
-  "app", "channel", "version", "build", "published_at", "notes_url", "sha256", "size",
-  "minimum_os",
+  "app", "channel", "version", "build", "published_at", "notes_url", "artifacts", "sha256",
+  "size", "minimum_os",
 ])
 func rejectsInvalidFields(field: String) throws {
   var bad = release()
@@ -78,6 +85,7 @@ func rejectsInvalidFields(field: String) throws {
   case "build": bad.build = 0
   case "published_at": bad.publishedAt = "yesterday"
   case "notes_url": bad.notesURL = "https://example.com/notes"
+  case "artifacts": bad.artifacts = []
   case "sha256": bad.artifacts[0].sha256 = "AB"
   case "size": bad.artifacts[0].size = 0
   case "minimum_os": bad.artifacts[0].minimumOS = "14.0.0.1"
@@ -134,8 +142,10 @@ func rejectsUnsafeArtifactURLs(url: String) throws {
 
 @Test func allowsOnlyKnownHTTPSHosts() {
   #expect(Transport.isAllowed(UpdateConfig.feedURL))
+  #expect(Transport.isAllowed(URL(string: "HTTPS://GitHub.COM/x")!))
   #expect(
     Transport.isAllowed(URL(string: "https://release-assets.githubusercontent.com/x")!))
+  #expect(!Transport.isAllowed(URL(string: "https://github.com:8443/x")!))
   #expect(!Transport.isAllowed(URL(string: "http://github.com/x")!))
   #expect(!Transport.isAllowed(URL(string: "https://evil.example.com/x")!))
   #expect(!Transport.isAllowed(URL(string: "https://user:pw@github.com/x")!))
@@ -143,4 +153,42 @@ func rejectsUnsafeArtifactURLs(url: String) throws {
 
 @Test func publicKeyParses() throws {
   #expect(try Feed.publicKey().rawRepresentation.count == 32)
+}
+
+@Test func publishReusesLiveFeedOnRerunAndRejectsRollbacks() throws {
+  let base = release(build: 7)
+  let (liveFeed, liveRelease) = try Feed.publish(
+    version: base.version, build: base.build, publishedAt: "2020-01-01T00:00:00Z",
+    notesURL: base.notesURL, artifacts: base.artifacts, privateKey: key,
+    publicKey: key.publicKey)
+
+  // Rerun without explicit publishedAt reuses the verified live feed verbatim
+  let (rerunFeed, rerunRelease) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKey: key, after: liveFeed, publicKey: key.publicKey)
+  #expect(rerunFeed == liveFeed)
+  #expect(rerunRelease == liveRelease)
+  try Feed.open(rerunFeed, publicKey: key.publicKey).verifySupersedes(liveRelease)
+
+  // Same build with altered artifact hash is rejected
+  var altered = base.artifacts
+  altered[0].sha256 = String(repeating: "cd", count: 32)
+  #expect(throws: FeedError.rollback(seen: 7, got: 7)) {
+    _ = try Feed.publish(
+      version: base.version, build: base.build, notesURL: base.notesURL,
+      artifacts: altered, privateKey: key, after: liveFeed, publicKey: key.publicKey)
+  }
+
+  // Higher build on an older version is rejected
+  #expect(throws: FeedError.invalid("version")) {
+    _ = try Feed.publish(
+      version: "1.1.9", build: 8, notesURL: base.notesURL, artifacts: base.artifacts,
+      privateKey: key, after: liveFeed, publicKey: key.publicKey)
+  }
+
+  // Advancing build and version produces a superseding feed
+  let (_, nextRelease) = try Feed.publish(
+    version: "1.2.1", build: 8, notesURL: base.notesURL, artifacts: base.artifacts,
+    privateKey: key, after: liveFeed, publicKey: key.publicKey)
+  try nextRelease.verifySupersedes(liveRelease)
 }

@@ -66,7 +66,8 @@ public enum Installer {
     var attributes: posix_spawnattr_t?
     posix_spawnattr_init(&attributes)
     defer { posix_spawnattr_destroy(&attributes) }
-    posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
+    posix_spawnattr_setflags(
+      &attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
     posix_spawnattr_setpgroup(&attributes, 0)
 
     var actions: posix_spawn_file_actions_t?
@@ -101,13 +102,19 @@ public enum Installer {
   /// read-only folders inside bundles otherwise block removal.
   public static func remove(_ folder: URL) {
     let manager = FileManager.default
-    if let items = manager.enumerator(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) {
+    func makeWritableDirectory(_ item: URL) {
+      let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+      guard values?.isDirectory == true, values?.isSymbolicLink == false else { return }
+      let mode = (try? manager.attributesOfItem(atPath: item.path)[.posixPermissions])
+        as? Int ?? 0
+      try? manager.setAttributes([.posixPermissions: mode | 0o700], ofItemAtPath: item.path)
+    }
+    makeWritableDirectory(folder)
+    if let items = manager.enumerator(
+      at: folder, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+    {
       for case let item as URL in items {
-        guard (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-        else { continue }
-        let mode = (try? manager.attributesOfItem(atPath: item.path)[.posixPermissions])
-          as? Int ?? 0
-        try? manager.setAttributes([.posixPermissions: mode | 0o700], ofItemAtPath: item.path)
+        makeWritableDirectory(item)
       }
     }
     try? manager.removeItem(at: folder)

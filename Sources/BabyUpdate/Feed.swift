@@ -54,7 +54,9 @@ public enum FeedError: LocalizedError, Equatable {
     case .badSignature: "The update feed's signature is not valid."
     case .invalid(let field): "The update feed has an invalid \(field)."
     case .rollback(let seen, let got):
-      "The update feed offers build \(got), older than build \(seen) already seen."
+      seen == got
+        ? "The update feed reuses build \(got) with different contents."
+        : "The update feed offers build \(got), older than build \(seen) already seen."
     }
   }
 }
@@ -182,9 +184,59 @@ public enum Feed {
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     return try encoder.encode(envelope) + Data("\n".utf8)
   }
+
+  /// Signs a release to succeed `live` (if any), reusing the verified `live`
+  /// feed verbatim on an idempotent rerun when `publishedAt` was not pinned.
+  public static func publish(
+    version: String, build: Int, publishedAt: String? = nil, notesURL: String?,
+    artifacts: [Artifact], privateKey: Curve25519.Signing.PrivateKey,
+    after live: Data? = nil, publicKey: Curve25519.Signing.PublicKey? = nil
+  ) throws -> (feed: Data, release: Release) {
+    let key = try publicKey ?? Self.publicKey()
+    guard privateKey.publicKey.rawRepresentation == key.rawRepresentation else {
+      throw FeedError.badSignature
+    }
+    let current = try live.map { try open($0, publicKey: key) }
+    if let live, let current, publishedAt == nil {
+      let candidate = Release(
+        version: version, build: build, publishedAt: current.publishedAt,
+        notesURL: notesURL, artifacts: artifacts)
+      if candidate == current {
+        return (live, current)
+      }
+    }
+    let release = Release(
+      version: version, build: build,
+      publishedAt: publishedAt ?? ISO8601DateFormatter().string(from: Date()),
+      notesURL: notesURL, artifacts: artifacts)
+    try release.validate()
+    if let current {
+      try release.verifySupersedes(current)
+    }
+    let feed = try seal(release, privateKey: privateKey)
+    guard try open(feed, publicKey: key) == release else {
+      throw FeedError.malformed
+    }
+    return (feed, release)
+  }
 }
 
 extension Release {
+  /// Rejects `self` unless it equals `current` or advances `build` without
+  /// regressing `version`.
+  public func verifySupersedes(_ current: Release) throws {
+    if self == current { return }
+    guard build > current.build else {
+      throw FeedError.rollback(seen: current.build, got: build)
+    }
+    guard let next = OSVersion(version),
+      let previous = OSVersion(current.version),
+      next >= previous
+    else {
+      throw FeedError.invalid("version")
+    }
+  }
+
   /// Rejects a release whose known fields carry values Baby cannot trust.
   public func validate() throws {
     guard schema == 1 else { throw FeedError.invalid("schema") }
@@ -192,7 +244,7 @@ extension Release {
     guard channel == UpdateConfig.channel else { throw FeedError.invalid("channel") }
     guard Self.isValidVersion(version) else { throw FeedError.invalid("version") }
     guard build > 0 else { throw FeedError.invalid("build") }
-    guard ISO8601DateFormatter().date(from: publishedAt) != nil else {
+    guard Self.isValidTimestamp(publishedAt) else {
       throw FeedError.invalid("published_at")
     }
     if let notesURL {
@@ -200,6 +252,7 @@ extension Release {
         throw FeedError.invalid("notes_url")
       }
     }
+    guard !artifacts.isEmpty else { throw FeedError.invalid("artifacts") }
     for artifact in artifacts {
       try artifact.validate()
     }
@@ -222,6 +275,15 @@ extension Release {
   /// The page to open for this release.
   public var pageURL: URL {
     notesURL.flatMap(URL.init(string:)) ?? UpdateConfig.releasesURL
+  }
+
+  // isValidTimestamp accepts RFC 3339 / ISO 8601 timestamps with or without
+  // fractional seconds.
+  static func isValidTimestamp(_ string: String) -> Bool {
+    if ISO8601DateFormatter().date(from: string) != nil { return true }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return fractional.date(from: string) != nil
   }
 
   // isValidVersion allows 1-64 characters from [A-Za-z0-9.+-] starting with

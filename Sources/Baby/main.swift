@@ -1,4 +1,5 @@
 import AppKit
+import BabyUpdate
 import SwiftUI
 
 /// Owns the menu bar item and the caffeinate process that keeps the Mac awake.
@@ -29,24 +30,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyEquivalent: "q"))
     // Accessory apps show no main menu, but its key equivalents still work
     // in the settings window.
+    let appMenu = NSMenu()
+    let mainSettingsItem = NSMenuItem(
+      title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+    mainSettingsItem.target = self
+    appMenu.addItem(mainSettingsItem)
+    appMenu.addItem(
+      withTitle: "Quit Baby", action: #selector(NSApplication.terminate(_:)),
+      keyEquivalent: "q")
+    let appMenuItem = NSMenuItem()
+    appMenuItem.submenu = appMenu
+
     let windowMenu = NSMenu()
     windowMenu.addItem(
       withTitle: "Close", action: #selector(NSWindow.performClose(_:)),
       keyEquivalent: "w")
     let windowMenuItem = NSMenuItem()
     windowMenuItem.submenu = windowMenu
-    NSApp.mainMenu = NSMenu()
-    NSApp.mainMenu?.addItem(windowMenuItem)
+
+    let mainMenu = NSMenu()
+    mainMenu.addItem(appMenuItem)
+    mainMenu.addItem(windowMenuItem)
+    NSApp.mainMenu = mainMenu
     menu.autoenablesItems = false
     menu.delegate = self
     statusItem.button?.target = self
     statusItem.button?.action = #selector(statusItemClicked)
     statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    statusItem.button?.setAccessibilityCustomActions([
+      NSAccessibilityCustomAction(name: "Show Menu") { [weak self] in
+        self?.showStatusMenu()
+        return true
+      }
+    ])
     update()
-    // --awake comes from relaunching after an update while awake
-    if UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch)
-      || CommandLine.arguments.contains("--awake")
-    {
+    // --awake and --asleep preserve the live state across an update relaunch,
+    // overriding the normal launch preference.
+    let args = CommandLine.arguments
+    let shouldStart =
+      if args.contains("--awake") {
+        true
+      } else if args.contains("--asleep") {
+        false
+      } else {
+        UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch)
+      }
+    if shouldStart {
       start()
     }
     updater?.start()
@@ -62,24 +91,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     caffeinate?.terminate()
   }
 
-  // statusItemClicked toggles on left click and shows the menu on right or
-  // control click.
+  // statusItemClicked toggles on left click and shows the menu on right,
+  // control, or option click.
   @objc private func statusItemClicked() {
     let event = NSApp.currentEvent
     let wantsMenu =
-      event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
+      event?.type == .rightMouseUp
+      || event?.modifierFlags.intersection([.control, .option]).isEmpty == false
     guard wantsMenu else {
       toggle()
       return
     }
-    // Attaching the menu only for this click keeps left clicks as toggles.
+    showStatusMenu()
+  }
+
+  // Attaching the menu only for this click keeps left clicks as toggles.
+  private func showStatusMenu() {
     statusItem.menu = menu
     statusItem.button?.performClick(nil)
     statusItem.menu = nil
   }
 
   @objc private func showSettings() {
-    if settingsWindow?.isVisible != true {
+    if settingsWindow == nil {
       let window = NSWindow(
         contentViewController: NSHostingController(
           rootView: SettingsView(
@@ -102,8 +136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     switch updater.state {
     case .ready:
       Task {
-        await updater.restartToUpdate(keepAwake: caffeinate != nil)
-        presentUpdateResult()
+        if await updater.restartToUpdate(isAwake: { self.caffeinate != nil }) {
+          NSApp.terminate(nil)
+        } else {
+          presentUpdateResult()
+        }
       }
     case .available(_, let page):
       NSWorkspace.shared.open(page)

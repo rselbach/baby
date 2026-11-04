@@ -25,14 +25,26 @@ public enum TransportError: LocalizedError, Equatable {
 public struct Transport: Sendable {
   /// The User-Agent sent with every request.
   public let userAgent: String
+  private let makeConfiguration: @Sendable () -> URLSessionConfiguration
 
   public init(userAgent: String) {
-    self.userAgent = userAgent
+    self.init(userAgent: userAgent, makeConfiguration: { .ephemeral })
   }
 
-  /// Whether `url` is an HTTPS URL on an allowed host without credentials.
+  init(
+    userAgent: String,
+    makeConfiguration: @escaping @Sendable () -> URLSessionConfiguration
+  ) {
+    self.userAgent = userAgent
+    self.makeConfiguration = makeConfiguration
+  }
+
+  /// Whether `url` is an HTTPS URL on an allowed host without credentials or a
+  /// non-default port.
   public static func isAllowed(_ url: URL) -> Bool {
-    guard url.scheme == "https", let host = url.host(),
+    guard url.scheme?.lowercased() == "https",
+      url.port == nil,
+      let host = url.host()?.lowercased(),
       UpdateConfig.allowedHosts.contains(host)
     else { return false }
     return url.user() == nil && url.password() == nil
@@ -87,9 +99,12 @@ public struct Transport: Sendable {
     var request = URLRequest(
       url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
     request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+    let configuration = makeConfiguration()
+    configuration.timeoutIntervalForRequest = timeout
+    configuration.timeoutIntervalForResource = timeout
     let session = URLSession(
-      configuration: .ephemeral, delegate: RedirectPolicy(), delegateQueue: nil)
-    defer { session.finishTasksAndInvalidate() }
+      configuration: configuration, delegate: RedirectPolicy(), delegateQueue: nil)
+    defer { session.invalidateAndCancel() }
 
     let (bytes, response) = try await session.bytes(for: request)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0

@@ -1,3 +1,5 @@
+import AppKit
+import BabyUpdate
 import ServiceManagement
 import SwiftUI
 
@@ -48,6 +50,12 @@ struct SettingsView: View {
     }
     .padding(30)
     .frame(width: 420, alignment: .leading)
+    .onAppear { loginStatus = SMAppService.mainApp.status }
+    .onReceive(
+      NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+    ) { _ in
+      loginStatus = SMAppService.mainApp.status
+    }
   }
 
   private func updates(_ updater: Updater) -> some View {
