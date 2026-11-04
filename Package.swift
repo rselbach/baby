@@ -8,6 +8,7 @@ let package = Package(
     .target(name: "BabyUpdate"),
     .executableTarget(name: "Baby", dependencies: ["BabyUpdate"]),
     .executableTarget(name: "baby-update-tool", dependencies: ["BabyUpdate"]),
+    .testTarget(name: "BabyTests", dependencies: ["Baby"]),
     .testTarget(name: "BabyUpdateTests", dependencies: ["BabyUpdate", "baby-update-tool"]),
   ]
 )

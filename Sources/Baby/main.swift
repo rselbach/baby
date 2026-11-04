@@ -8,27 +8,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let statusItem = NSStatusBar.system.statusItem(
     withLength: NSStatusItem.squareLength)
   private let menu = NSMenu()
+  private let durations = NSMenu()
   private let updateItem = NSMenuItem(
     title: "Check for Updates…", action: #selector(performUpdateAction), keyEquivalent: "")
   private let updater = Updater()
+  private let presets = ActivationPresets()
   private var caffeinate: Process?
   private var activationEndsAt: Date?
   private var settingsWindow: NSWindow?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    let durations = NSMenu()
     durations.autoenablesItems = false
-    for (title, minutes) in [
-      ("Permanent (default)", 0),
-      ("5 minutes", 5), ("10 minutes", 10), ("15 minutes", 15),
-      ("30 minutes", 30), ("1 hour", 60), ("2 hours", 120), ("5 hours", 300),
-    ] {
-      let item = NSMenuItem(
-        title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
-      item.target = self
-      item.tag = minutes * 60
-      durations.addItem(item)
-    }
     let activateItem = NSMenuItem(title: "Activate for", action: nil, keyEquivalent: "")
     activateItem.submenu = durations
     menu.addItem(activateItem)
@@ -59,6 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let appMenuItem = NSMenuItem()
     appMenuItem.submenu = appMenu
 
+    let editMenu = NSMenu(title: "Edit")
+    for (title, action, key) in [
+      ("Cut", #selector(NSText.cut(_:)), "x"),
+      ("Copy", #selector(NSText.copy(_:)), "c"),
+      ("Paste", #selector(NSText.paste(_:)), "v"),
+      ("Select All", #selector(NSText.selectAll(_:)), "a"),
+    ] {
+      editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
+    }
+    let editMenuItem = NSMenuItem()
+    editMenuItem.submenu = editMenu
+
     let windowMenu = NSMenu()
     windowMenu.addItem(
       withTitle: "Close", action: #selector(NSWindow.performClose(_:)),
@@ -68,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     let mainMenu = NSMenu()
     mainMenu.addItem(appMenuItem)
+    mainMenu.addItem(editMenuItem)
     mainMenu.addItem(windowMenuItem)
     NSApp.mainMenu = mainMenu
     menu.autoenablesItems = false
@@ -102,6 +105,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func menuNeedsUpdate(_ menu: NSMenu) {
+    durations.removeAllItems()
+    for minutes in [0] + presets.minutes {
+      let title = minutes == 0 ? "Permanent (default)" : ActivationPresets.title(for: minutes)
+      let item = NSMenuItem(
+        title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
+      item.target = self
+      item.tag = minutes * 60
+      durations.addItem(item)
+    }
     guard let updater else { return }
     updateItem.title = updater.state.actionTitle
     updateItem.isEnabled = updater.state.actionEnabled
@@ -137,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       let window = NSWindow(
         contentViewController: NSHostingController(
           rootView: SettingsView(
+            presets: presets,
             updater: updater,
             updateAction: { [weak self] in self?.performUpdateAction() })))
       window.title = "Baby Settings"

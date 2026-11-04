@@ -11,6 +11,8 @@ enum SettingsKey {
 
 /// The settings window content.
 struct SettingsView: View {
+  /// Saved durations shared with the activation menu.
+  let presets: ActivationPresets
   /// The updater, or nil for builds that never update.
   let updater: Updater?
   /// Runs the updater's current action, such as checking or restarting.
@@ -18,6 +20,7 @@ struct SettingsView: View {
   @AppStorage(SettingsKey.activateOnLaunch) private var activateOnLaunch = false
   @State private var loginStatus = SMAppService.mainApp.status
   @State private var loginError: String?
+  @State private var presetMinutes = ""
 
   var body: some View {
     VStack(alignment: .leading, spacing: 20) {
@@ -43,6 +46,8 @@ struct SettingsView: View {
         "Activate on Launch",
         detail: "Immediately starts preventing sleep when Baby opens.",
         isOn: $activateOnLaunch)
+      Divider()
+      presetEditor
       if let updater {
         Divider()
         updates(updater)
@@ -56,6 +61,80 @@ struct SettingsView: View {
     ) { _ in
       loginStatus = SMAppService.mainApp.status
     }
+  }
+
+  private var presetEditor: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Temporary activation presets")
+        .font(.headline)
+      Text("Choose these durations from Activate for.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+      if presets.minutes.isEmpty {
+        Text("No temporary presets. Add one below.")
+          .foregroundStyle(.secondary)
+      } else {
+        ScrollView {
+          VStack(spacing: 6) {
+            ForEach(presets.minutes, id: \.self) { minutes in
+              HStack {
+                Text(ActivationPresets.title(for: minutes))
+                Spacer()
+                Button {
+                  presets.remove(minutes: minutes)
+                } label: {
+                  Image(systemName: "minus.circle")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Remove \(ActivationPresets.title(for: minutes)) preset")
+              }
+              .frame(height: 22)
+            }
+          }
+        }
+        .frame(height: min(CGFloat(presets.minutes.count) * 28, 168))
+      }
+      HStack {
+        TextField("Minutes", text: $presetMinutes)
+          .frame(width: 100)
+          .accessibilityLabel("Preset duration in minutes")
+          .onSubmit(addPreset)
+        Button("Add", action: addPreset)
+          .disabled(minutesToAdd == nil)
+      }
+      if !presetMinutes.isEmpty, minutesToAdd == nil {
+        Text(presetFeedback)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  private var parsedMinutes: Int? {
+    guard let minutes = Int(presetMinutes.trimmingCharacters(in: .whitespacesAndNewlines)),
+      (1...ActivationPresets.maximumMinutes).contains(minutes)
+    else {
+      return nil
+    }
+    return minutes
+  }
+
+  private var minutesToAdd: Int? {
+    guard let minutes = parsedMinutes, !presets.minutes.contains(minutes) else { return nil }
+    return minutes
+  }
+
+  private var presetFeedback: String {
+    if parsedMinutes != nil {
+      return "This preset already exists."
+    }
+    return "Enter whole minutes between 1 and \(ActivationPresets.maximumMinutes)."
+  }
+
+  private func addPreset() {
+    guard let minutes = minutesToAdd else { return }
+    presets.add(minutes: minutes)
+    presetMinutes = ""
   }
 
   private func updates(_ updater: Updater) -> some View {
