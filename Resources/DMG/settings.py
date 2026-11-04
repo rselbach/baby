@@ -18,4 +18,9 @@ arrange_by = None
 icon_size = 96
 text_size = 13
 label_pos = "bottom"
-icon_locations = {"Baby.app": (192, 230), "Applications": (576, 230)}
+icon_locations = {
+    "Baby.app": (192, 230),
+    "Applications": (576, 230),
+    # Keep the background offscreen even when Finder shows hidden files.
+    ".background.tiff": (10000, 10000),
+}
