@@ -12,9 +12,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     title: "Check for Updates…", action: #selector(performUpdateAction), keyEquivalent: "")
   private let updater = Updater()
   private var caffeinate: Process?
+  private var activationEndsAt: Date?
   private var settingsWindow: NSWindow?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    let durations = NSMenu()
+    durations.autoenablesItems = false
+    for (title, minutes) in [
+      ("Permanent (default)", 0),
+      ("5 minutes", 5), ("10 minutes", 10), ("15 minutes", 15),
+      ("30 minutes", 30), ("1 hour", 60), ("2 hours", 120), ("5 hours", 300),
+    ] {
+      let item = NSMenuItem(
+        title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
+      item.target = self
+      item.tag = minutes * 60
+      durations.addItem(item)
+    }
+    let activateItem = NSMenuItem(title: "Activate for", action: nil, keyEquivalent: "")
+    activateItem.submenu = durations
+    menu.addItem(activateItem)
+    menu.addItem(.separator())
     let settingsItem = NSMenuItem(
       title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
     settingsItem.target = self
@@ -64,18 +82,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       }
     ])
     update()
-    // --awake and --asleep preserve the live state across an update relaunch,
+    // Relaunch arguments preserve the live state across an update,
     // overriding the normal launch preference.
     let args = CommandLine.arguments
-    let shouldStart =
-      if args.contains("--awake") {
-        true
-      } else if args.contains("--asleep") {
-        false
-      } else {
-        UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch)
+    let deadlinePrefix = "--awake-until="
+    if let argument = args.first(where: { $0.hasPrefix(deadlinePrefix) }) {
+      if let timestamp = TimeInterval(argument.dropFirst(deadlinePrefix.count)),
+        timestamp.isFinite
+      {
+        start(until: Date(timeIntervalSince1970: timestamp))
       }
-    if shouldStart {
+    } else if args.contains("--awake")
+      || (!args.contains("--asleep")
+        && UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch))
+    {
       start()
     }
     updater?.start()
@@ -136,7 +156,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     switch updater.state {
     case .ready:
       Task {
-        if await updater.restartToUpdate(isAwake: { self.caffeinate != nil }) {
+        if await updater.restartToUpdate(launchArguments: {
+          guard self.caffeinate != nil else { return ["--asleep"] }
+          if let deadline = self.activationEndsAt {
+            return ["--awake-until=\(deadline.timeIntervalSince1970)"]
+          }
+          return ["--awake"]
+        }) {
           NSApp.terminate(nil)
         } else {
           presentUpdateResult()
@@ -193,11 +219,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return
     }
     caffeinate = nil
+    activationEndsAt = nil
     running.terminate()
     update()
   }
 
-  private func start() {
+  @objc private func activateFor(_ sender: NSMenuItem) {
+    start(until: sender.tag == 0 ? nil : Date().addingTimeInterval(TimeInterval(sender.tag)))
+  }
+
+  private func start(until deadline: Date? = nil) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
     // -d display, -i idle, -s system (on AC power). -w ties caffeinate's
@@ -205,6 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     process.arguments = [
       "-dis", "-w", String(ProcessInfo.processInfo.processIdentifier),
     ]
+    if let deadline {
+      guard let seconds = UInt32(exactly: ceil(deadline.timeIntervalSinceNow)), seconds > 0 else {
+        return
+      }
+      process.arguments?.append(contentsOf: ["-t", String(seconds)])
+    }
     let id = ObjectIdentifier(process)
     process.terminationHandler = { [weak self] _ in
       Task { @MainActor in self?.caffeinateExited(id) }
@@ -216,7 +253,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       NSAlert(error: error).runModal()
       return
     }
+    let previous = caffeinate
     caffeinate = process
+    activationEndsAt = deadline
+    previous?.terminate()
     update()
   }
 
@@ -226,6 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return
     }
     caffeinate = nil
+    activationEndsAt = nil
     update()
   }
 
@@ -236,7 +277,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     image?.isTemplate = true
     image?.accessibilityDescription = awake ? "Sleep prevented" : "Sleep allowed"
     button.image = image
-    button.toolTip = awake ? "Baby: keeping your Mac awake" : "Baby: sleep allowed"
+    if awake, let deadline = activationEndsAt {
+      let time = deadline.formatted(date: .omitted, time: .shortened)
+      button.toolTip = "Baby: keeping your Mac awake until \(time)"
+    } else {
+      button.toolTip = awake ? "Baby: keeping your Mac awake" : "Baby: sleep allowed"
+    }
   }
 }
 

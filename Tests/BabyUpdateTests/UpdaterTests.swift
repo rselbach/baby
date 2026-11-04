@@ -168,7 +168,9 @@ private func installedBuild(at app: URL) -> String? {
 }
 
 @MainActor
-@Test func preservesStagedUpdateWhenNewerReleaseCannotBeInstalled() async throws {
+@Test(arguments: [["--asleep"], ["--awake"], ["--awake-until=1793808000.0"]])
+func preservesStagedUpdateWhenNewerReleaseCannotBeInstalled(launchArguments: [String]) async throws
+{
   let root = FileManager.default.temporaryDirectory
     .appending(path: "updater-\(UUID().uuidString)", directoryHint: .isDirectory)
   try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -204,11 +206,11 @@ private func installedBuild(at app: URL) -> String? {
     #expect(updater.state == .ready(version: "1.1.0"))
     currentFeed.withLock { $0 = v20NewerOS.feed }
 
-    let shouldQuit = await updater.restartToUpdate(isAwake: { false })
+    let shouldQuit = await updater.restartToUpdate(launchArguments: { launchArguments })
     #expect(shouldQuit)
     #expect(installedBuild(at: app) == "2")
     #expect(
-      relaunched.withLock { $0 } == ["/usr/bin/open", "-n", app.path, "--args", "--asleep"])
+      relaunched.withLock { $0 } == ["/usr/bin/open", "-n", app.path, "--args"] + launchArguments)
   }
 
   // Case 2: newer feed's ZIP download fails -> keeps and installs staged v1.1 (build 2)
@@ -238,11 +240,11 @@ private func installedBuild(at app: URL) -> String? {
     #expect(updater.state == .ready(version: "1.1.0"))
     currentFeed.withLock { $0 = v12BrokenZip.feed }
 
-    let shouldQuit = await updater.restartToUpdate(isAwake: { true })
+    let shouldQuit = await updater.restartToUpdate(launchArguments: { launchArguments })
     #expect(shouldQuit)
     #expect(installedBuild(at: app) == "2")
     #expect(
-      relaunched.withLock { $0 } == ["/usr/bin/open", "-n", app.path, "--args", "--awake"])
+      relaunched.withLock { $0 } == ["/usr/bin/open", "-n", app.path, "--args"] + launchArguments)
   }
 }
 
@@ -283,7 +285,7 @@ private func installedBuild(at app: URL) -> String? {
     #expect(updater.state == .ready(version: "1.1.0"))
     currentFeed.withLock { $0 = v12.feed }
 
-    #expect(await updater.restartToUpdate(isAwake: { true }))
+    #expect(await updater.restartToUpdate(launchArguments: { ["--awake"] }))
     #expect(installedBuild(at: app) == "3")
   }
 
@@ -309,7 +311,7 @@ private func installedBuild(at app: URL) -> String? {
       relaunch: { _ in throw POSIXError(.EAGAIN) })
 
     await updater.check()
-    #expect(!(await updater.restartToUpdate(isAwake: { false })))
+    #expect(!(await updater.restartToUpdate(launchArguments: { ["--asleep"] })))
     #expect(installedBuild(at: app) == "1")
     guard case .failed = updater.state else {
       Issue.record("expected .failed after rollback, got \(updater.state)")

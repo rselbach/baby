@@ -152,7 +152,8 @@ public final class Updater {
 
   /// Installs the staged update and schedules Baby to relaunch once this
   /// process exits. Returns `true` when the caller should terminate the app.
-  public func restartToUpdate(isAwake: () -> Bool) async -> Bool {
+  /// Reads `launchArguments` just before scheduling to preserve current state.
+  public func restartToUpdate(launchArguments: () -> [String]) async -> Bool {
     guard case .ready = state, staged != nil else { return false }
     state = .installing
 
@@ -185,9 +186,7 @@ public final class Updater {
       state = .failed(error.localizedDescription)
       return false
     }
-    let command = [
-      "/usr/bin/open", "-n", bundleURL.path, "--args", isAwake() ? "--awake" : "--asleep",
-    ]
+    let command = ["/usr/bin/open", "-n", bundleURL.path, "--args"] + launchArguments()
     do {
       try relaunch(command)
     } catch {
