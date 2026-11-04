@@ -2,6 +2,14 @@ import AppKit
 import BabyUpdate
 import SwiftUI
 
+// activation is how a caffeinate run ends.
+private enum Activation {
+  case indefinite
+  // seconds is the chosen duration, nil when an update relaunch restored
+  // only the deadline.
+  case timed(seconds: Int?, endsAt: Date)
+}
+
 /// Owns the menu bar item and the caffeinate process that keeps the Mac awake.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -10,14 +18,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let menu = NSMenu()
   private let updateItem = NSMenuItem(
     title: "Check for Updates…", action: #selector(performUpdateAction), keyEquivalent: "")
+  private let durations = NSMenu()
+  private let remainingItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+  private let remainingSeparator = NSMenuItem.separator()
+  private let remainingFormatter: DateComponentsFormatter = {
+    let formatter = DateComponentsFormatter()
+    formatter.unitsStyle = .short
+    formatter.allowedUnits = [.hour, .minute, .second]
+    formatter.includesTimeRemainingPhrase = true
+    return formatter
+  }()
   private let updater = Updater()
-  private var caffeinate: Process?
-  private var activationEndsAt: Date?
+  private var caffeinate: (process: Process, activation: Activation)?
+  private var countdown: Timer?
   private var settingsWindow: NSWindow?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    let durations = NSMenu()
     durations.autoenablesItems = false
+    remainingItem.isEnabled = false
+    durations.addItem(remainingItem)
+    durations.addItem(remainingSeparator)
     for (title, minutes) in [
       ("Permanent (default)", 0),
       ("5 minutes", 5), ("10 minutes", 10), ("15 minutes", 15),
@@ -90,13 +110,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       if let timestamp = TimeInterval(argument.dropFirst(deadlinePrefix.count)),
         timestamp.isFinite
       {
-        start(until: Date(timeIntervalSince1970: timestamp))
+        start(.timed(seconds: nil, endsAt: Date(timeIntervalSince1970: timestamp)))
       }
     } else if args.contains("--awake")
       || (!args.contains("--asleep")
         && UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch))
     {
-      start()
+      start(.indefinite)
     }
     updater?.start()
   }
@@ -107,8 +127,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     updateItem.isEnabled = updater.state.actionEnabled
   }
 
+  // The timer runs in common modes so the countdown ticks while the menu
+  // tracks events.
+  func menuWillOpen(_ menu: NSMenu) {
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.refreshDurations() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    countdown = timer
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    countdown?.invalidate()
+    countdown = nil
+  }
+
   func applicationWillTerminate(_ notification: Notification) {
-    caffeinate?.terminate()
+    caffeinate?.process.terminate()
   }
 
   // statusItemClicked toggles on left click and shows the menu on right,
@@ -157,11 +192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .ready:
       Task {
         if await updater.restartToUpdate(launchArguments: {
-          guard self.caffeinate != nil else { return ["--asleep"] }
-          if let deadline = self.activationEndsAt {
-            return ["--awake-until=\(deadline.timeIntervalSince1970)"]
+          switch self.caffeinate?.activation {
+          case nil: ["--asleep"]
+          case .indefinite: ["--awake"]
+          case .timed(_, let endsAt): ["--awake-until=\(endsAt.timeIntervalSince1970)"]
           }
-          return ["--awake"]
         }) {
           NSApp.terminate(nil)
         } else {
@@ -215,20 +250,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   private func toggle() {
     guard let running = caffeinate else {
-      start()
+      start(.indefinite)
       return
     }
     caffeinate = nil
-    activationEndsAt = nil
-    running.terminate()
+    running.process.terminate()
     update()
   }
 
   @objc private func activateFor(_ sender: NSMenuItem) {
-    start(until: sender.tag == 0 ? nil : Date().addingTimeInterval(TimeInterval(sender.tag)))
+    guard sender.tag > 0 else {
+      start(.indefinite)
+      return
+    }
+    start(
+      .timed(seconds: sender.tag, endsAt: Date().addingTimeInterval(TimeInterval(sender.tag))))
   }
 
-  private func start(until deadline: Date? = nil) {
+  private func start(_ activation: Activation) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
     // -d display, -i idle, -s system (on AC power). -w ties caffeinate's
@@ -236,8 +275,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     process.arguments = [
       "-dis", "-w", String(ProcessInfo.processInfo.processIdentifier),
     ]
-    if let deadline {
-      guard let seconds = UInt32(exactly: ceil(deadline.timeIntervalSinceNow)), seconds > 0 else {
+    if case .timed(_, let endsAt) = activation {
+      guard let seconds = UInt32(exactly: ceil(endsAt.timeIntervalSinceNow)), seconds > 0 else {
         return
       }
       process.arguments?.append(contentsOf: ["-t", String(seconds)])
@@ -254,19 +293,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return
     }
     let previous = caffeinate
-    caffeinate = process
-    activationEndsAt = deadline
-    previous?.terminate()
+    caffeinate = (process, activation)
+    previous?.process.terminate()
     update()
   }
 
   // caffeinateExited resets state when caffeinate dies on its own.
   private func caffeinateExited(_ id: ObjectIdentifier) {
-    guard let running = caffeinate, ObjectIdentifier(running) == id else {
+    guard let running = caffeinate, ObjectIdentifier(running.process) == id else {
       return
     }
     caffeinate = nil
-    activationEndsAt = nil
     update()
   }
 
@@ -277,11 +314,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     image?.isTemplate = true
     image?.accessibilityDescription = awake ? "Sleep prevented" : "Sleep allowed"
     button.image = image
-    if awake, let deadline = activationEndsAt {
-      let time = deadline.formatted(date: .omitted, time: .shortened)
+    if case .timed(_, let endsAt) = caffeinate?.activation {
+      let time = endsAt.formatted(date: .omitted, time: .shortened)
       button.toolTip = "Baby: keeping your Mac awake until \(time)"
     } else {
       button.toolTip = awake ? "Baby: keeping your Mac awake" : "Baby: sleep allowed"
+    }
+    refreshDurations()
+  }
+
+  // refreshDurations checks the running duration and shows a timed run's
+  // remaining time above the choices.
+  private func refreshDurations() {
+    var checkedTag: Int?
+    var endsAt: Date?
+    switch caffeinate?.activation {
+    case nil: break
+    case .indefinite: checkedTag = 0
+    case .timed(let seconds, let deadline):
+      checkedTag = seconds
+      endsAt = deadline
+    }
+    for item in durations.items where item.action == #selector(activateFor(_:)) {
+      item.state = item.tag == checkedTag ? .on : .off
+    }
+    remainingItem.isHidden = endsAt == nil
+    remainingSeparator.isHidden = endsAt == nil
+    guard let endsAt else { return }
+    let title =
+      remainingFormatter.string(from: max(0, ceil(endsAt.timeIntervalSinceNow))) ?? ""
+    if remainingItem.title != title {
+      remainingItem.title = title
     }
   }
 }
