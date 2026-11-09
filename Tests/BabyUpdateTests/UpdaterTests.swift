@@ -423,3 +423,42 @@ func waitsForAnInstallationBeforeQuitting(restart: Bool) async throws {
   #expect(installedBuild(at: app) == "2")
   #expect(await installation.value)
 }
+
+@MainActor
+@Test func marksThePreviousBundleForRecoveryWhenRollbackFails() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let app = root.appending(path: "Baby.app")
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  let next = try packageRelease(in: root, version: "1.1.0", build: 2)
+  let token = "updater-stranded-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { request in
+    request.url == UpdateConfig.feedURL ? .init(body: next.feed) : .init(body: next.zip)
+  }
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement,
+    relaunch: { _ in
+      try FileManager.default.moveItem(at: app, to: root.appending(path: "displaced.app"))
+      throw POSIXError(.EAGAIN)
+    })
+  await updater.check()
+  #expect(!(await updater.restartToUpdate(launchArguments: { ["--asleep"] })))
+  guard case .stranded = updater.state else {
+    Issue.record("expected a stranded update, got \(updater.state)")
+    return
+  }
+  let folders = try FileManager.default.contentsOfDirectory(
+    at: root, includingPropertiesForKeys: nil)
+  let recovery = try #require(
+    folders.first { $0.lastPathComponent.hasPrefix(Installer.stagingPrefix) })
+  #expect(installedBuild(at: recovery.appending(path: "Baby.app")) == "1")
+  #expect(
+    FileManager.default.fileExists(atPath: recovery.appending(path: "recovery-required").path))
+}

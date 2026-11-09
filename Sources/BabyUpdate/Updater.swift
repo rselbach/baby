@@ -204,6 +204,7 @@ public final class Updater {
       }
       return false
     }
+    Installer.allowCleanup(staged.folder)
     state = .installed
     return true
   }
@@ -222,6 +223,7 @@ public final class Updater {
     do {
       try await Self.install(
         staged, over: bundleURL, runningBuild: build, os: os, requirement: codeRequirement)
+      Installer.allowCleanup(staged.folder)
       state = .installed
     } catch {
       discardStaged()
@@ -315,6 +317,7 @@ public final class Updater {
     }
     try await BundleCheck.verify(
       app: staged.app, release: staged.release, os: os, requirement: requirement)
+    try Installer.preserveForRecovery(staged.folder)
     try Installer.swap(staged.app, installed)
   }
 }

@@ -5,6 +5,17 @@ import Foundation
 public enum Installer {
   /// Name prefix of staging folders; nothing else is ever removed.
   public static let stagingPrefix = ".baby-update-"
+  static let recoveryMarker = "recovery-required"
+
+  // mark before swapping so a crash or failed rollback preserves the old app.
+  static func preserveForRecovery(_ folder: URL) throws {
+    try Data().write(to: folder.appending(path: recoveryMarker), options: .atomic)
+  }
+
+  static func allowCleanup(_ folder: URL) {
+    // a failed removal retains the recovery copy rather than risking its loss.
+    try? FileManager.default.removeItem(at: folder.appending(path: recoveryMarker))
+  }
 
   /// Creates a new staging folder in `parent` named after `build` and this
   /// process, never reusing an existing one.
@@ -91,10 +102,14 @@ public enum Installer {
   public static func removeLeftovers(in parent: URL) {
     let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
     for name in names where name.hasPrefix(stagingPrefix) {
+      let folder = parent.appending(path: name)
+      if FileManager.default.fileExists(atPath: folder.appending(path: recoveryMarker).path) {
+        continue
+      }
       let fields = name.dropFirst(stagingPrefix.count).split(separator: "-")
       guard fields.count == 3, let pid = pid_t(fields[1]), pid != getpid() else { continue }
       if kill(pid, 0) == 0 || errno == EPERM { continue }
-      remove(parent.appending(path: name))
+      remove(folder)
     }
   }
 

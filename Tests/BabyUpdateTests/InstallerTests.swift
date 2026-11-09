@@ -74,6 +74,18 @@ private func exitedPID() throws -> pid_t {
   #expect(FileManager.default.fileExists(atPath: marker.path))
 }
 
+@Test func keepsRecoveryCopiesAfterTheirOwnerExits() throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let folder = root.appending(path: "\(Installer.stagingPrefix)7-\(try exitedPID())-deadbeef")
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  let app = folder.appending(path: "Baby.app")
+  try Data("previous version".utf8).write(to: app)
+  try Data().write(to: folder.appending(path: "recovery-required"))
+  Installer.removeLeftovers(in: root)
+  #expect(try Data(contentsOf: app) == Data("previous version".utf8))
+}
+
 @Test func unzipsDittoArchives() async throws {
   let root = try temporaryFolder()
   defer { Installer.remove(root) }
@@ -108,6 +120,29 @@ private func exitedPID() throws -> pid_t {
 
   Installer.remove(lockedRoot)
   #expect(!FileManager.default.fileExists(atPath: lockedRoot.path))
+}
+
+@Test(arguments: [false, true])
+func cleanupDoesNotChangeSymlinkTargets(nested: Bool) throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let target = root.appending(path: "Greendale/Records")
+  let files = FileManager.default
+  try files.createDirectory(at: target, withIntermediateDirectories: true)
+  let marker = target.appending(path: "Troy.txt")
+  try Data("Troy Barnes".utf8).write(to: marker)
+  try files.setAttributes([.posixPermissions: 0o500], ofItemAtPath: target.path)
+  let stage = root.appending(path: "stage")
+  if nested {
+    try files.createDirectory(at: stage, withIntermediateDirectories: true)
+  }
+  let link = nested ? stage.appending(path: "link") : stage
+  try files.createSymbolicLink(at: link, withDestinationURL: target.deletingLastPathComponent())
+
+  Installer.remove(stage)
+  #expect(!files.fileExists(atPath: stage.path))
+  #expect(try Data(contentsOf: marker) == Data("Troy Barnes".utf8))
+  #expect(try files.attributesOfItem(atPath: target.path)[.posixPermissions] as? Int == 0o500)
 }
 
 @Test func closesExtraFileDescriptorsInWaiter() async throws {
