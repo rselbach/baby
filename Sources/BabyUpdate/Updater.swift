@@ -111,7 +111,7 @@ public final class Updater {
     Task.detached { Installer.removeLeftovers(in: parent) }
     Task {
       try? await Task.sleep(for: Self.launchDelay)
-      if automaticChecks { await check() }
+      await checkIfDue()
     }
     timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) {
       [weak self] _ in

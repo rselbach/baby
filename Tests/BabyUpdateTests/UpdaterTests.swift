@@ -129,6 +129,10 @@ private func installedBuild(at app: URL) -> String? {
   // successful check stamps lastUpdateCheck, throttling subsequent polls
   await updater.checkIfDue()
   #expect(calls.withLock { $0 } == 2)
+
+  updater.start()
+  try await Task.sleep(for: .seconds(11))
+  #expect(calls.withLock { $0 } == 2)
 }
 
 @MainActor
