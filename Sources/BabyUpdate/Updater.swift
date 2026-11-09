@@ -203,6 +203,21 @@ public final class Updater {
     return true
   }
 
+  /// Installs the staged update without relaunching, so the next launch runs
+  /// it. Baby calls this as it quits: a staged update left behind is deleted
+  /// as a leftover on the next launch.
+  public func installBeforeQuit() async {
+    guard case .ready = state, let staged else { return }
+    state = .installing
+    do {
+      try await Self.install(
+        staged, over: bundleURL, runningBuild: build, os: os, requirement: codeRequirement)
+    } catch {
+      discardStaged()
+      state = .failed(error.localizedDescription)
+    }
+  }
+
   func checkIfDue() async {
     guard automaticChecks else { return }
     if let last = defaults.object(forKey: Key.lastCheck) as? Date,

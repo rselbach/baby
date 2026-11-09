@@ -320,6 +320,43 @@ func preservesStagedUpdateWhenNewerReleaseCannotBeInstalled(launchArguments: [St
   }
 }
 
+@MainActor
+@Test func installsStagedUpdateBeforeQuitWithoutRelaunching() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appending(path: "updater-\(UUID().uuidString)", directoryHint: .isDirectory)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+
+  let suite = "baby.tests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defer { defaults.removePersistentDomain(forName: suite) }
+
+  let dir = root.appending(path: "quit", directoryHint: .isDirectory)
+  let app = dir.appending(path: "Baby.app", directoryHint: .isDirectory)
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  let v11 = try packageRelease(in: root, version: "1.1.0", build: 2)
+
+  let token = "updater-quit-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { req in
+    req.url == UpdateConfig.feedURL ? .init(body: v11.feed) : .init(body: v11.zip)
+  }
+  let relaunched = OSAllocatedUnfairLock(initialState: false)
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, relaunch: { _ in relaunched.withLock { $0 = true } })
+
+  await updater.installBeforeQuit()
+  #expect(installedBuild(at: app) == "1")
+
+  await updater.check()
+  #expect(updater.state == .ready(version: "1.1.0"))
+  await updater.installBeforeQuit()
+  #expect(installedBuild(at: app) == "2")
+  #expect(!relaunched.withLock { $0 })
+}
+
 @Test func updateToolValidatesFlagsAndFeedMonotonicity() throws {
   let binDir = URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
   var tool = binDir.appending(path: "baby-update-tool")
