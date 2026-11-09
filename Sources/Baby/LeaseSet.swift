@@ -6,8 +6,18 @@ import Foundation
 struct LeaseSet {
   /// The ID of the lease the menu bar item holds for the user.
   static let userID = "user"
+  /// Reserves one slot for the user and bounds status and relaunch messages.
+  static let maximumAgentLeases = 63
   /// Active leases, in the order they were first held.
   private(set) var leases: [Lease] = []
+
+  init() {}
+
+  init(restoring data: Data) throws {
+    for lease in try ControlCoding.decoder().decode([Lease].self, from: data) {
+      try hold(lease)
+    }
+  }
 
   var isEmpty: Bool { leases.isEmpty }
 
@@ -40,8 +50,16 @@ struct LeaseSet {
   var holdsUserLease: Bool { leases.contains { $0.id == Self.userID } }
 
   /// Adds `lease`, replacing a lease with the same ID in place.
-  mutating func hold(_ lease: Lease) {
+  mutating func hold(_ lease: Lease) throws(LeaseRequestError) {
+    try lease.validate()
     guard let index = leases.firstIndex(where: { $0.id == lease.id }) else {
+      guard
+        lease.id == Self.userID
+          || leases.count - (holdsUserLease ? 1 : 0) < Self.maximumAgentLeases
+      else {
+        throw LeaseRequestError(
+          message: "Baby can hold at most \(Self.maximumAgentLeases) agent leases at a time.")
+      }
       leases.append(lease)
       return
     }
@@ -82,10 +100,6 @@ extension Lease {
     throws(LeaseRequestError)
   {
     let id = request.id ?? UUID().uuidString.prefix(8).lowercased()
-    guard (1...64).contains(id.count), id.allSatisfy(Self.idCharacters.contains) else {
-      throw LeaseRequestError(
-        message: "Lease IDs are 1 to 64 letters, digits, dots, dashes, or underscores.")
-    }
     guard id != LeaseSet.userID else {
       throw LeaseRequestError(message: "The lease ID \"user\" is reserved for Baby's menu.")
     }
@@ -93,7 +107,8 @@ extension Lease {
     if let seconds = request.seconds {
       guard seconds > 0, seconds <= Self.maximumSeconds else {
         throw LeaseRequestError(
-          message: "A lease's duration must be positive and at most \(Int(Self.maximumSeconds)) seconds.")
+          message:
+            "A lease's duration must be positive and at most \(Int(Self.maximumSeconds)) seconds.")
       }
       deadline = now.addingTimeInterval(seconds)
     }
@@ -105,6 +120,24 @@ extension Lease {
     let label = String(
       (request.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
     self.init(id: id, label: label.isEmpty ? id : label, deadline: deadline, pid: request.pid)
+    try validate()
+  }
+
+  fileprivate func validate() throws(LeaseRequestError) {
+    guard (1...64).contains(id.count), id.allSatisfy(Self.idCharacters.contains) else {
+      throw LeaseRequestError(
+        message: "Lease IDs are 1 to 64 letters, digits, dots, dashes, or underscores.")
+    }
+    guard label.count <= 64, label.utf8.count <= 256 else {
+      throw LeaseRequestError(
+        message: "Lease labels must fit in 64 characters and 256 UTF-8 bytes.")
+    }
+    if let pid, pid <= 0 {
+      throw LeaseRequestError(message: "Process \(pid) is not running.")
+    }
+    if let deadline, !deadline.timeIntervalSince1970.isFinite {
+      throw LeaseRequestError(message: "The lease deadline must be finite.")
+    }
   }
 }
 

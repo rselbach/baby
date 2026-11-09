@@ -1,40 +1,42 @@
-import BabyControl
 import Foundation
 import Testing
 
 @testable import Baby
+@testable import BabyControl
 
 private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-@Test func holdsLeasesInOrderAndReplacesByID() {
+@Test func holdsLeasesInOrderAndReplacesByID() throws {
   var set = LeaseSet()
-  set.hold(Lease(id: "troy", label: "Troy"))
-  set.hold(Lease(id: "abed", label: "Abed"))
-  set.hold(Lease(id: "troy", label: "Troy Barnes", pid: 7))
+  try set.hold(Lease(id: "troy", label: "Troy"))
+  try set.hold(Lease(id: "abed", label: "Abed"))
+  try set.hold(Lease(id: "troy", label: "Troy Barnes", pid: 7))
   #expect(
-    set.leases == [Lease(id: "troy", label: "Troy Barnes", pid: 7), Lease(id: "abed", label: "Abed")])
+    set.leases == [
+      Lease(id: "troy", label: "Troy Barnes", pid: 7), Lease(id: "abed", label: "Abed"),
+    ])
   set.removeAll { $0.id == "troy" }
   #expect(set.leases.map(\.id) == ["abed"])
   #expect(!set.isEmpty)
 }
 
-@Test func findsTheEarliestDeadline() {
+@Test func findsTheEarliestDeadline() throws {
   var set = LeaseSet()
   #expect(set.nextDeadline == nil)
-  set.hold(Lease(id: "permanent", label: "Permanent"))
+  try set.hold(Lease(id: "permanent", label: "Permanent"))
   #expect(set.nextDeadline == nil)
-  set.hold(Lease(id: "late", label: "Late", deadline: now.addingTimeInterval(600)))
-  set.hold(Lease(id: "soon", label: "Soon", deadline: now.addingTimeInterval(60)))
+  try set.hold(Lease(id: "late", label: "Late", deadline: now.addingTimeInterval(600)))
+  try set.hold(Lease(id: "soon", label: "Soon", deadline: now.addingTimeInterval(60)))
   #expect(set.nextDeadline == now.addingTimeInterval(60))
 }
 
-@Test func removesExpiredLeasesAndExitedProcesses() {
+@Test func removesExpiredLeasesAndExitedProcesses() throws {
   var set = LeaseSet()
-  set.hold(Lease(id: "expired", label: "Expired", deadline: now))
-  set.hold(Lease(id: "future", label: "Future", deadline: now.addingTimeInterval(1)))
-  set.hold(Lease(id: "exited", label: "Exited", pid: 10))
-  set.hold(Lease(id: "running", label: "Running", pid: 11))
-  set.hold(Lease(id: "permanent", label: "Permanent"))
+  try set.hold(Lease(id: "expired", label: "Expired", deadline: now))
+  try set.hold(Lease(id: "future", label: "Future", deadline: now.addingTimeInterval(1)))
+  try set.hold(Lease(id: "exited", label: "Exited", pid: 10))
+  try set.hold(Lease(id: "running", label: "Running", pid: 11))
+  try set.hold(Lease(id: "permanent", label: "Permanent"))
   set.removeFinished(now: now, isRunning: { $0 == 11 })
   #expect(set.leases.map(\.id) == ["future", "running", "permanent"])
 }
@@ -100,33 +102,90 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
   #expect(!processIsRunning(Int32.max))
 }
 
-@Test func keepsTheDisplayOnOnlyForTheUser() {
+@Test func keepsTheDisplayOnOnlyForTheUser() throws {
   var set = LeaseSet()
   #expect(set.powerAssertions.isEmpty)
-  set.hold(Lease(id: "abed", label: "Abed"))
+  try set.hold(Lease(id: "abed", label: "Abed"))
   #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep])
-  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  try set.hold(Lease(id: LeaseSet.userID, label: "You"))
   #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep, .displaySleep])
   set.removeAll { $0.id == "abed" }
   #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep, .displaySleep])
 }
 
-@Test func tracksTheUsersLeaseApartFromAgents() {
+@Test func tracksTheUsersLeaseApartFromAgents() throws {
   var set = LeaseSet()
   #expect(!set.holdsUserLease)
-  set.hold(Lease(id: "abed", label: "Abed"))
+  try set.hold(Lease(id: "abed", label: "Abed"))
   #expect(!set.holdsUserLease)
-  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  try set.hold(Lease(id: LeaseSet.userID, label: "You"))
   #expect(set.holdsUserLease)
   set.removeAll { $0.id == "abed" }
   #expect(set.holdsUserLease)
 }
 
-@Test func indicatesWhoKeepsTheMacAwake() {
+@Test func indicatesWhoKeepsTheMacAwake() throws {
   var set = LeaseSet()
   #expect(set.indicator == .asleep)
-  set.hold(Lease(id: "abed", label: "Abed"))
+  try set.hold(Lease(id: "abed", label: "Abed"))
   #expect(set.indicator == .awakeForOthers)
-  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  try set.hold(Lease(id: LeaseSet.userID, label: "You"))
   #expect(set.indicator == .awakeForUser)
+}
+
+@Test func boundsAgentLeasesAndKeepsRoomForTheUser() throws {
+  var set = LeaseSet()
+  for index in 0..<63 {
+    try set.hold(Lease(id: "troy-\(index)", label: "Troy Barnes"))
+  }
+  #expect(throws: LeaseRequestError.self) {
+    try set.hold(Lease(id: "abed", label: "Abed Nadir"))
+  }
+  try set.hold(Lease(id: "troy-0", label: "Greendale"))
+  try set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  #expect(set.leases.count == 64)
+  #expect(set.leases.first?.label == "Greendale")
+  set.removeAll { $0.id == "troy-1" }
+  try set.hold(Lease(id: "abed", label: "Abed Nadir"))
+  #expect(set.leases.count == 64)
+}
+
+@Test func rejectsLabelsWithUnboundedCombiningCharacters() {
+  let label = "a" + String(repeating: "\u{0301}", count: 300)
+  #expect(label.count == 1)
+  #expect(throws: LeaseRequestError.self) {
+    try Lease(
+      holding: ControlRequest(command: .hold, label: label), now: now, isRunning: { _ in true })
+  }
+}
+
+@Test func fullLeaseSetsFitTheStatusAndRelaunchFormats() throws {
+  var set = LeaseSet()
+  for index in 0..<LeaseSet.maximumAgentLeases {
+    let suffix = String(index)
+    let id = String(repeating: "t", count: 64 - suffix.count) + suffix
+    try set.hold(
+      Lease(
+        id: id, label: String(repeating: "\u{0001}", count: 64),
+        deadline: .distantFuture, pid: Int32.max))
+  }
+  try set.hold(Lease(id: LeaseSet.userID, label: "You", deadline: .distantFuture))
+  let response = try ControlCoding.encoder().encode(ControlResponse(leases: set.leases))
+  #expect(response.count <= maximumMessageSize)
+  let data = try ControlCoding.encoder().encode(set.leases)
+  #expect(("--leases=" + data.base64EncodedString()).utf8.count < 64 * 1024)
+  #expect(try LeaseSet(restoring: data).leases == set.leases)
+}
+
+@Test func validatesRestoredLeaseState() throws {
+  let cases = [
+    [Lease(id: "troy", label: "Troy", pid: 0)],
+    [Lease(id: "../troy", label: "Troy")],
+    [Lease(id: "troy", label: String(repeating: "a", count: 65))],
+    (0...LeaseSet.maximumAgentLeases).map { Lease(id: "troy-\($0)", label: "Troy") },
+  ]
+  for leases in cases {
+    let data = try ControlCoding.encoder().encode(leases)
+    #expect(throws: LeaseRequestError.self) { try LeaseSet(restoring: data) }
+  }
 }

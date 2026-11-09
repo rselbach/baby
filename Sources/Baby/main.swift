@@ -115,9 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       do {
         // invalid base64 decodes to nothing, which the JSON decoder rejects
         let data = Data(base64Encoded: String(encoded)) ?? Data()
-        for lease in try ControlCoding.decoder().decode([Lease].self, from: data) {
-          leases.hold(lease)
-        }
+        leases = try LeaseSet(restoring: data)
       } catch {
         log.error("could not restore leases: \(error.localizedDescription, privacy: .public)")
       }
@@ -161,10 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       let lease: Lease
       do {
         lease = try Lease(holding: request, now: Date(), isRunning: processIsRunning)
+        leases.removeFinished(now: Date(), isRunning: processIsRunning)
+        try leases.hold(lease)
       } catch {
         return ControlResponse(error: error.message)
       }
-      leases.hold(lease)
       if let error = apply() {
         return ControlResponse(error: error.localizedDescription)
       }
@@ -366,8 +365,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   private func holdForUser(until deadline: Date?) {
     if let deadline, deadline <= Date() { return }
-    leases.hold(Lease(id: LeaseSet.userID, label: "You", deadline: deadline))
-    presentFailure(apply())
+    do {
+      try leases.hold(Lease(id: LeaseSet.userID, label: "You", deadline: deadline))
+      presentFailure(apply())
+    } catch {
+      presentFailure(error)
+    }
   }
 
   private func presentFailure(_ error: (any Error)?) {
