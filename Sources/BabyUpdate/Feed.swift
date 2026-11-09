@@ -286,15 +286,9 @@ extension Release {
     return fractional.date(from: string) != nil
   }
 
-  // isValidVersion allows 1-64 characters from [A-Za-z0-9.+-] starting with
-  // a digit; versions name folders, so nothing else gets through.
+  // release versions use the same numeric ordering as minimum OS versions.
   static func isValidVersion(_ version: String) -> Bool {
-    guard (1...64).contains(version.count), version.first?.isASCII == true,
-      version.first?.isNumber == true
-    else { return false }
-    return version.allSatisfy {
-      $0.isASCII && ($0.isLetter || $0.isNumber || "+-.".contains($0))
-    }
+    version.utf8.count <= 64 && OSVersion(version) != nil
   }
 
   // isSafeURL accepts only an exact https URL under prefix, with no

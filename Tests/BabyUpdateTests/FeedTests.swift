@@ -158,6 +158,13 @@ func rejectsUnsafeArtifactURLs(url: String) throws {
   #expect(try Feed.publicKey().rawRepresentation.count == 32)
 }
 
+@Test(arguments: ["1.2.0-beta", "1.2.0+build", "1.2.3.4", "9223372036854775808", "1..2"])
+func rejectsReleaseVersionsThatCannotBeOrdered(version: String) throws {
+  var candidate = release()
+  candidate.version = version
+  #expect(throws: FeedError.invalid("version")) { try candidate.validate() }
+}
+
 @Test func publishReusesLiveFeedOnRerunAndRejectsRollbacks() throws {
   let base = release(build: 7)
   let (liveFeed, liveRelease) = try Feed.publish(

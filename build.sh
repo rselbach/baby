@@ -45,13 +45,28 @@ build_binary() {
     -Xlinker "${minimum}" -Xlinker "${sdk}"
 }
 
+valid_version() {
+  local version="$1"
+  [[ ${#version} -le 64 && "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
+    || return 1
+  local parts=()
+  local part
+  IFS=. read -r -a parts <<<"${version}"
+  for part in "${parts[@]}"; do
+    part="${part#"${part%%[!0]*}"}"
+    if (( ${#part} > 19 )); then
+      return 1
+    fi
+    # shellcheck disable=SC2071 # avoid overflowing shell integer arithmetic
+    if (( ${#part} == 19 )) && [[ "${part}" > 9223372036854775807 ]]; then
+      return 1
+    fi
+  done
+}
+
 stamp_version() {
   local plist="$1"
   if [[ -n "${VERSION:-}" ]]; then
-    if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9.+-]{0,63}$ ]]; then
-      echo "error: VERSION must match [0-9][A-Za-z0-9.+-]{0,63}" >&2
-      exit 1
-    fi
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" \
       "${plist}"
   fi
@@ -108,6 +123,10 @@ make_status_images() {
 }
 
 main() {
+  if [[ -n "${VERSION:-}" ]] && ! valid_version "${VERSION}"; then
+    echo "error: VERSION must contain one to three numeric 64-bit components" >&2
+    exit 1
+  fi
   build_binary Baby
   build_binary BabyCLI
   local bin_dir
