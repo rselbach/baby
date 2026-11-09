@@ -7,7 +7,7 @@ let usage = """
     baby hold [--for DURATION] [--pid PID] [--id ID] [--label LABEL]
         Keep the Mac awake until released, DURATION passes, or PID exits.
         Holding an existing ID replaces that lease. Prints the lease ID.
-    baby release ID
+    baby release [--] ID
         Release a lease. Releasing a lease that already ended succeeds.
     baby status [--json]
         Show whether Baby is keeping the Mac awake, and for whom.
@@ -55,7 +55,10 @@ extension Command {
         rest, allowed: ["--for", "--pid", "--id", "--label"], takesCommand: false)
       return .hold(options)
     case "release":
-      guard rest.count == 1, let id = rest.first, !id.hasPrefix("-") else {
+      let ids = rest.first == "--" ? rest.dropFirst() : rest[...]
+      guard ids.count == 1, let id = ids.first, !id.isEmpty,
+        rest.first == "--" || !id.hasPrefix("-")
+      else {
         throw UsageError(message: "release needs exactly one lease ID")
       }
       return .release(id: id)

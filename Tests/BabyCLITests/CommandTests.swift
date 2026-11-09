@@ -19,6 +19,8 @@ import Testing
       .hold(HoldOptions(seconds: 1800, pid: 4821, id: "claude", label: "Claude Code"))
     ),
     "release": (["release", "claude"], .release(id: "claude")),
+    "release leading dash": (["release", "--", "-troy"], .release(id: "-troy")),
+    "release option-shaped id": (["release", "--", "--all"], .release(id: "--all")),
     "status": (["status"], .status(json: false)),
     "status json": (["status", "--json"], .status(json: true)),
     "help": (["help"], .help),
@@ -45,6 +47,9 @@ import Testing
     "zero pid": (["hold", "--pid", "0"], "invalid process ID 0"),
     "release nothing": (["release"], "release needs exactly one lease ID"),
     "release two": (["release", "a", "b"], "release needs exactly one lease ID"),
+    "release empty id": (["release", ""], "release needs exactly one lease ID"),
+    "release empty after --": (["release", "--", ""], "release needs exactly one lease ID"),
+    "release two after --": (["release", "--", "a", "b"], "release needs exactly one lease ID"),
     "release option": (["release", "--all"], "release needs exactly one lease ID"),
     "status option": (["status", "--yaml"], "status only accepts --json"),
   ]
