@@ -18,6 +18,7 @@ public final class Updater {
     case ready(version: String)
     case available(version: String, page: URL)
     case installing
+    case installed
     case stranded(String)
   }
 
@@ -58,6 +59,7 @@ public final class Updater {
   private let relaunch: @Sendable ([String]) throws -> Void
   private var staged: Staged?
   private var timer: Timer?
+  private var installationWaiters: [CheckedContinuation<Void, Never>] = []
 
   /// Nil when not running from an app bundle with a numeric build, such as
   /// under `swift run`; such builds never update.
@@ -121,7 +123,7 @@ public final class Updater {
   /// stages it. Does nothing while busy or once an update is staged.
   public func check() async {
     switch state {
-    case .checking, .downloading, .ready, .installing, .stranded: return
+    case .checking, .downloading, .ready, .installing, .installed, .stranded: return
     default: break
     }
     state = .checking
@@ -156,6 +158,7 @@ public final class Updater {
   public func restartToUpdate(launchArguments: () -> [String]) async -> Bool {
     guard case .ready = state, staged != nil else { return false }
     state = .installing
+    defer { finishInstallation() }
 
     // a staged update can wait for days: if the feed now offers a newer
     // installable build, try staging that first; otherwise install what we have
@@ -166,7 +169,6 @@ public final class Updater {
         currentBuild: build, os: os, arch: arch),
       let parent = replaceableParent()
     {
-      state = .downloading(version: newerRelease.version)
       if let replacement = try? await Self.stage(
         newerRelease, artifact, in: parent, transport: transport, os: os,
         requirement: codeRequirement)
@@ -174,10 +176,12 @@ public final class Updater {
         discardStaged()
         staged = replacement
       }
-      state = .installing
     }
 
-    guard let staged else { return false }
+    guard let staged else {
+      state = .failed("The staged update is no longer available.")
+      return false
+    }
     do {
       try await Self.install(
         staged, over: bundleURL, runningBuild: build, os: os, requirement: codeRequirement)
@@ -200,6 +204,7 @@ public final class Updater {
       }
       return false
     }
+    state = .installed
     return true
   }
 
@@ -207,15 +212,27 @@ public final class Updater {
   /// it. Baby calls this as it quits: a staged update left behind is deleted
   /// as a leftover on the next launch.
   public func installBeforeQuit() async {
+    if case .installing = state {
+      await withCheckedContinuation { installationWaiters.append($0) }
+      return
+    }
     guard case .ready = state, let staged else { return }
     state = .installing
+    defer { finishInstallation() }
     do {
       try await Self.install(
         staged, over: bundleURL, runningBuild: build, os: os, requirement: codeRequirement)
+      state = .installed
     } catch {
       discardStaged()
       state = .failed(error.localizedDescription)
     }
+  }
+
+  private func finishInstallation() {
+    let waiters = installationWaiters
+    installationWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
   }
 
   func checkIfDue() async {
@@ -303,6 +320,14 @@ public final class Updater {
 }
 
 extension Updater.State {
+  /// Whether quitting must finish or wait for an installation first.
+  public var needsInstallationBeforeQuit: Bool {
+    switch self {
+    case .ready, .installing: true
+    default: false
+    }
+  }
+
   /// The title of the menu item and Settings button for this state.
   public var actionTitle: String {
     switch self {
@@ -310,7 +335,7 @@ extension Updater.State {
     case .downloading: "Downloading Update…"
     case .ready: "Restart to Update"
     case .available(let version, _): "Download Baby \(version)…"
-    case .installing: "Restarting…"
+    case .installing, .installed: "Restarting…"
     case .idle, .upToDate, .failed, .requiresNewerOS, .stranded: "Check for Updates…"
     }
   }
@@ -318,7 +343,7 @@ extension Updater.State {
   /// Whether the action can run in this state.
   public var actionEnabled: Bool {
     switch self {
-    case .checking, .downloading, .installing, .stranded: false
+    case .checking, .downloading, .installing, .installed, .stranded: false
     default: true
     }
   }
@@ -326,7 +351,7 @@ extension Updater.State {
   /// A sentence describing this state, if there is anything to say.
   public var caption: String? {
     switch self {
-    case .idle, .checking, .installing: nil
+    case .idle, .checking, .installing, .installed: nil
     case .upToDate: "Baby is up to date."
     case .failed(let reason): "Couldn't update Baby: \(reason)"
     case .requiresNewerOS(let version, let minimum):

@@ -386,3 +386,40 @@ func preservesStagedUpdateWhenNewerReleaseCannotBeInstalled(launchArguments: [St
   #expect(status != 0)
   #expect(errText.contains("unknown option --verison"))
 }
+
+@MainActor
+@Test(arguments: [false, true])
+func waitsForAnInstallationBeforeQuitting(restart: Bool) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let app = root.appending(path: "Baby.app")
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  let next = try packageRelease(in: root, version: "1.1.0", build: 2)
+  let token = "updater-quit-wait-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { request in
+    request.url == UpdateConfig.feedURL ? .init(body: next.feed) : .init(body: next.zip)
+  }
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, relaunch: { _ in })
+  await updater.check()
+  try #require(updater.state == .ready(version: "1.1.0"))
+  let installation = Task {
+    if restart { return await updater.restartToUpdate(launchArguments: { ["--asleep"] }) }
+    await updater.installBeforeQuit()
+    return true
+  }
+  while updater.state == .ready(version: "1.1.0") { await Task.yield() }
+  #expect(updater.state.needsInstallationBeforeQuit)
+  await updater.installBeforeQuit()
+  #expect(updater.state == .installed)
+  #expect(!updater.state.needsInstallationBeforeQuit)
+  #expect(installedBuild(at: app) == "2")
+  #expect(await installation.value)
+}

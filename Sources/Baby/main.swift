@@ -211,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   // A staged update is installed on the way out, so the next launch runs it.
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    guard let updater, case .ready = updater.state else { return .terminateNow }
+    guard let updater, updater.state.needsInstallationBeforeQuit else { return .terminateNow }
     Task {
       await updater.installBeforeQuit()
       sender.reply(toApplicationShouldTerminate: true)
