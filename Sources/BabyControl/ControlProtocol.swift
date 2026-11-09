@@ -59,7 +59,25 @@ public enum ControlCoding {
   /// Returns an encoder that writes dates as ISO 8601 and sorts keys.
   public static func encoder() -> JSONEncoder {
     let encoder = JSONEncoder()
-    encoder.dateEncodingStrategy = .iso8601
+    encoder.dateEncodingStrategy = .custom { date, encoder in
+      let timestamp = date.timeIntervalSince1970
+      guard timestamp.isFinite else {
+        throw EncodingError.invalidValue(
+          date, .init(codingPath: encoder.codingPath, debugDescription: "Non-finite deadline"))
+      }
+      var seconds = floor(timestamp)
+      var nanoseconds = Int(((timestamp - seconds) * 1_000_000_000).rounded())
+      if nanoseconds == 1_000_000_000 {
+        seconds += 1
+        nanoseconds = 0
+      }
+      var text = Date(timeIntervalSince1970: seconds).ISO8601Format()
+      if nanoseconds != 0 {
+        text = String(text.dropLast()) + String(format: ".%09dZ", nanoseconds)
+      }
+      var container = encoder.singleValueContainer()
+      try container.encode(text)
+    }
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     return encoder
   }
@@ -67,7 +85,19 @@ public enum ControlCoding {
   /// Returns a decoder that reads ISO 8601 dates.
   public static func decoder() -> JSONDecoder {
     let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .iso8601
+    decoder.dateDecodingStrategy = .custom { decoder in
+      let container = try decoder.singleValueContainer()
+      let text = try container.decode(String.self)
+      for fractional in [true, false] {
+        if let date = try? Date.ISO8601FormatStyle(includingFractionalSeconds: fractional).parse(
+          text)
+        {
+          return date
+        }
+      }
+      throw DecodingError.dataCorruptedError(
+        in: container, debugDescription: "Invalid ISO 8601 date")
+    }
     return decoder
   }
 }

@@ -210,3 +210,13 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
   #expect(json == #"{"deadline":"1970-01-01T00:00:00Z","id":"abed","label":"Abed Nadir"}"#)
   #expect(try ControlCoding.decoder().decode(Lease.self, from: Data(json.utf8)) == lease)
 }
+
+@Test(arguments: [1_800_000_000.75, 1_800_000_000.1234567, -0.5])
+func preservesSubsecondDeadlines(timestamp: TimeInterval) throws {
+  let lease = Lease(
+    id: "troy", label: "Troy Barnes", deadline: Date(timeIntervalSince1970: timestamp))
+  let data = try ControlCoding.encoder().encode(lease)
+  let restored = try ControlCoding.decoder().decode(Lease.self, from: data)
+  let deadline = try #require(restored.deadline)
+  #expect(abs(deadline.timeIntervalSince1970 - timestamp) < 0.000001)
+}
