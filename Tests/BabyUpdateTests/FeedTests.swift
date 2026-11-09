@@ -32,6 +32,20 @@ private func encode(_ envelope: [String: String]) throws -> Data {
   #expect(try Feed.open(feed, publicKey: key.publicKey) == release())
 }
 
+@Test func signsTheDMGWithoutChangingTheUpdaterArtifact() throws {
+  var candidate = release()
+  var dmg = candidate.artifacts[0]
+  dmg.kind = "dmg"
+  dmg.url = UpdateConfig.artifactPrefix + "v1.2.0/Installer.dmg"
+  candidate.artifacts.insert(dmg, at: 0)
+  let feed = try Feed.seal(candidate, privateKey: key)
+  let restored = try Feed.open(feed, publicKey: key.publicKey)
+  #expect(restored == candidate)
+  #expect(
+    restored.decide(currentBuild: 6, os: OSVersion("14")!, arch: "arm64")
+      == .install(candidate, candidate.artifacts[1]))
+}
+
 @Test func rejectsOtherKeys() throws {
   let feed = try Feed.seal(release(), privateKey: key)
   #expect(throws: FeedError.badSignature) {

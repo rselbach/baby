@@ -154,6 +154,8 @@ jobs:
               echo "complete=false"
               echo "zip_path=${existing_dir}/${zip}"
               echo "has_zip=${has_zip}"
+              echo "dmg_path=${existing_dir}/${dmg}"
+              echo "has_dmg=${has_dmg}"
             } >>"${GITHUB_OUTPUT}"
           fi
 
@@ -190,10 +192,15 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           HAS_EXISTING_ZIP: ${{ steps.existing.outputs.has_zip }}
           EXISTING_ZIP: ${{ steps.existing.outputs.zip_path }}
+          HAS_EXISTING_DMG: ${{ steps.existing.outputs.has_dmg }}
+          EXISTING_DMG: ${{ steps.existing.outputs.dmg_path }}
         run: |
           ./release.sh
           if [[ "${HAS_EXISTING_ZIP}" == "true" ]]; then
             cp "${EXISTING_ZIP}" "build/Baby-${VERSION}-macos-arm64.zip"
+          fi
+          if [[ "${HAS_EXISTING_DMG}" == "true" ]]; then
+            cp "${EXISTING_DMG}" "build/Baby-${VERSION}-macos-arm64.dmg"
           fi
 
       - name: Sign the update feed
@@ -204,6 +211,7 @@ jobs:
           LIVE_FEED: ${{ steps.live.outputs.path }}
         run: |
           zip="Baby-${VERSION}-macos-arm64.zip"
+          dmg="Baby-${VERSION}-macos-arm64.dmg"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
           minimum_os="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
             Resources/Info.plist)"
@@ -217,6 +225,7 @@ jobs:
             --minimum-os "${minimum_os}" \
             --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
             --zip "build/${zip}" --zip-url "${base}/${zip}" \
+            --dmg "build/${dmg}" --dmg-url "${base}/${dmg}" \
             ${after_args[@]+"${after_args[@]}"} \
             --out _site/update.json <<<"${SIGNING_KEY}"
           if [[ -n "${LIVE_FEED}" ]]; then
@@ -235,9 +244,9 @@ jobs:
             build/Baby-${{ steps.version.outputs.version }}-macos-arm64.zip
             build/Baby-${{ steps.version.outputs.version }}-macos-arm64.dmg
 
-      # the feed goes live only once the published ZIP is the signed one,
+      # the feed goes live only once the published artifacts match the feed,
       # fetched through the app's own transport and URL policy
-      - name: Verify the published ZIP
+      - name: Verify published artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ github.run_number }}
@@ -256,7 +265,7 @@ jobs:
             echo "verification attempt ${attempt} failed; retrying" >&2
             sleep 15
           done
-          echo "::error::the published ZIP does not match the signed feed"
+          echo "::error::the published artifacts do not match the signed feed"
           exit 1
 
       - name: Upload Pages artifact

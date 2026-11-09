@@ -20,6 +20,11 @@ jobs:
       - name: Test
         run: swift test
 
+      - name: Test release tooling and website
+        run: |
+          python3 Tests/BuildTests/test_versions.py
+          node --test Tests/SiteTests/*.test.mjs
+
       - name: Build app bundle
         env:
           SIGNING_IDENTITY: '-'

@@ -7,7 +7,7 @@ import Foundation
 let usage = """
   usage:
     baby-update-tool sign-feed --version V --build N --minimum-os M
-        --notes-url URL --zip PATH --zip-url URL --out FILE
+        --notes-url URL --zip PATH --zip-url URL --dmg PATH --dmg-url URL --out FILE
         [--after LIVE_FILE] [--published-at RFC3339]   (base64 Ed25519 seed on stdin)
     baby-update-tool verify-feed FILE [--version V] [--build N]
         [--after LIVE_FILE] [--download]
@@ -97,23 +97,26 @@ func sha256Hex(of url: URL) throws -> (size: Int64, digest: String) {
 
 func signFeed(_ args: Arguments) throws {
   let key = try readSigningKey()
-  let zip = URL(filePath: try args.require("zip"))
-  let (size, digest) = try sha256Hex(of: zip)
+  let artifacts = try [("zip", "app-zip"), ("dmg", "dmg")].map { option, kind in
+    let file = URL(filePath: try args.require(option))
+    let (size, digest) = try sha256Hex(of: file)
+    var artifact = Artifact(
+      arch: "arm64", minimumOS: try args.require("minimum-os"),
+      url: try args.require("\(option)-url"), size: size, sha256: digest)
+    artifact.kind = kind
+    return artifact
+  }
   let live = try args.options["after"].map { try Data(contentsOf: URL(filePath: $0)) }
   let (feed, release) = try Feed.publish(
     version: try args.require("version"),
     build: try args.requireBuild(),
     publishedAt: args.options["published-at"],
     notesURL: try args.require("notes-url"),
-    artifacts: [
-      Artifact(
-        arch: "arm64", minimumOS: try args.require("minimum-os"),
-        url: try args.require("zip-url"), size: size, sha256: digest)
-    ],
+    artifacts: artifacts,
     privateKey: key,
     after: live)
   try feed.write(to: URL(filePath: try args.require("out")), options: .atomic)
-  print("signed \(release.version) (\(release.build)), \(size) bytes, sha256 \(digest)")
+  print("signed \(release.version) (\(release.build)), \(artifacts.count) artifacts")
 }
 
 func verifyFeed(_ args: Arguments) async throws {
@@ -165,7 +168,7 @@ do {
         rest,
         options: [
           "version", "build", "minimum-os", "notes-url", "zip", "zip-url", "out",
-          "published-at", "after",
+          "dmg", "dmg-url", "published-at", "after",
         ],
         positionalCount: 0))
   case "verify-feed":
