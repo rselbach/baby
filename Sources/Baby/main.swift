@@ -28,6 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var settingsWindow: NSWindow?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    guard startServer() else {
+      NSApp.terminate(nil)
+      return
+    }
     durations.autoenablesItems = false
     let activateItem = NSMenuItem(title: "Activate for", action: nil, keyEquivalent: "")
     activateItem.submenu = durations
@@ -98,7 +102,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
     update()
     restoreLaunchState()
-    startServer()
     updater?.start()
   }
 
@@ -136,13 +139,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
   }
 
-  private func startServer() {
+  private func startServer() -> Bool {
     do {
       server = try ControlServer(url: ControlSocket.defaultURL) { [weak self] request in
         self?.handle(request) ?? ControlResponse(error: "Baby is quitting.")
       }
+      return true
+    } catch ControlError.alreadyRunning {
+      return false
     } catch {
       log.error("control socket unavailable: \(error.localizedDescription, privacy: .public)")
+      presentFailure(error)
+      return false
     }
   }
 

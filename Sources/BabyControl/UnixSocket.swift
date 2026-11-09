@@ -5,6 +5,8 @@ import Foundation
 public enum ControlError: LocalizedError, Equatable, Sendable {
   /// Nothing is listening on the socket.
   case notRunning
+  /// Another Baby already owns this control socket.
+  case alreadyRunning
   /// The socket path does not fit in a socket address.
   case pathTooLong(String)
   /// The other end sent something that is not a control message.
@@ -15,6 +17,7 @@ public enum ControlError: LocalizedError, Equatable, Sendable {
   public var errorDescription: String? {
     switch self {
     case .notRunning: "Baby is not running."
+    case .alreadyRunning: "Baby is already running."
     case .pathTooLong(let path): "The control socket path is too long: \(path)"
     case .badMessage: "Baby sent a reply that could not be read."
     case .system(let call, let code): "\(call) failed: \(String(cString: strerror(code)))"

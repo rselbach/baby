@@ -82,18 +82,34 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
 @MainActor
 @Test func replacesAStaleSocket() async throws {
   try await withSocketURL { url in
-    let first = try ControlServer(url: url) { _ in ControlResponse(error: "first") }
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let stale = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(stale >= 0)
+    let status = try withAddress(url.path) { bind(stale, $0, $1) }
+    close(stale)
+    try #require(status == 0)
+    let server = try ControlServer(url: url) { _ in ControlResponse(error: "Troy") }
+    defer { server.stop() }
+    #expect(try await send(ControlRequest(command: .status), to: url).error == "Troy")
+  }
+}
+
+@MainActor
+@Test func keepsTheFirstServerReachable() async throws {
+  try await withSocketURL { url in
+    let first = try ControlServer(url: url) { _ in ControlResponse(error: "Troy") }
+    defer { first.stop() }
+    #expect(throws: ControlError.alreadyRunning) {
+      let second = try ControlServer(url: url) { _ in ControlResponse(error: "Abed") }
+      second.stop()
+    }
+    #expect(try await send(ControlRequest(command: .status), to: url).error == "Troy")
     first.stop()
-    // a crashed Baby leaves its socket file behind
-    let stale = try ControlServer(url: url) { _ in ControlResponse(error: "stale") }
-    let second = try ControlServer(url: url) { _ in ControlResponse(error: "second") }
-    defer { second.stop() }
-    let response = try await send(ControlRequest(command: .status), to: url)
-    #expect(response.error == "second")
-    // the replaced server must not remove its successor's socket
-    stale.stop()
-    #expect(FileManager.default.fileExists(atPath: url.path))
-    #expect(try await send(ControlRequest(command: .status), to: url).error == "second")
+    let replacement = try ControlServer(url: url) { _ in ControlResponse(error: "Abed") }
+    defer { replacement.stop() }
+    first.stop()
+    #expect(try await send(ControlRequest(command: .status), to: url).error == "Abed")
   }
 }
 
@@ -106,6 +122,26 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
     await #expect(throws: ControlError.notRunning) {
       try await send(ControlRequest(command: .status), to: url)
     }
+  }
+}
+
+@MainActor
+@Test func preservesAListenerWithoutALockFile() async throws {
+  try await withSocketURL { url in
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(listener >= 0)
+    defer { close(listener) }
+    try #require(try withAddress(url.path) { bind(listener, $0, $1) } == 0)
+    try #require(listen(listener, 16) == 0)
+    let before = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber]
+    #expect(throws: ControlError.alreadyRunning) {
+      let server = try ControlServer(url: url) { _ in ControlResponse() }
+      server.stop()
+    }
+    let after = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber]
+    #expect(before as? NSNumber == after as? NSNumber)
   }
 }
 
