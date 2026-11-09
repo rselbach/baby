@@ -74,12 +74,10 @@ func readMessage(_ fd: Int32) throws -> Data {
     }
     if count == 0 { return message }
     let chunk = buffer[..<count]
-    if let newline = chunk.firstIndex(of: 0x0A) {
-      message.append(contentsOf: chunk[..<newline])
-      return message
-    }
-    message.append(contentsOf: chunk)
+    let newline = chunk.firstIndex(of: 0x0A)
+    message.append(contentsOf: chunk[..<(newline ?? chunk.endIndex)])
     guard message.count <= maximumMessageSize else { throw ControlError.badMessage }
+    if newline != nil { return message }
   }
 }
 
