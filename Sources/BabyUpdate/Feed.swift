@@ -335,8 +335,8 @@ public struct OSVersion: Comparable, Sendable, CustomStringConvertible {
     guard (1...3).contains(pieces.count) else { return nil }
     var parts: [Int] = []
     for piece in pieces {
-      guard !piece.isEmpty, piece.allSatisfy(\.isASCII), let value = Int(piece),
-        value >= 0
+      guard !piece.isEmpty, piece.allSatisfy({ $0.isASCII && $0.isNumber }),
+        let value = Int(piece)
       else { return nil }
       parts.append(value)
     }

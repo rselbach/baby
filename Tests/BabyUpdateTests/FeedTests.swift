@@ -138,6 +138,9 @@ func rejectsUnsafeArtifactURLs(url: String) throws {
   #expect(OSVersion("27.0")! > OSVersion("14.9.9")!)
   #expect(OSVersion("14.a") == nil)
   #expect(OSVersion("") == nil)
+  for invalid in ["+14", "14.+2", "14.-0", "-0", "14..1", "14.2.", "١٤"] {
+    #expect(OSVersion(invalid) == nil, "\(invalid)")
+  }
 }
 
 @Test func allowsOnlyKnownHTTPSHosts() {
