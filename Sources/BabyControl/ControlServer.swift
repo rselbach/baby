@@ -33,23 +33,38 @@ public final class ControlServer: Sendable {
     source.resume()
   }
 
+  deinit {
+    stop()
+  }
+
   /// Stops listening and removes the socket, unless a newer Baby has
   /// already replaced it.
   public func stop() {
+    guard !source.isCancelled else { return }
     source.cancel()
     var info = stat()
-    if stat(path, &info) == 0, info.st_ino == inode {
+    if lstat(path, &info) == 0, info.st_ino == inode {
       unlink(path)
     }
   }
 
   // listen binds fd to path and returns the socket file's inode.
   private static func listen(_ fd: Int32, at path: String) throws -> ino_t {
-    guard unlink(path) == 0 || errno == ENOENT else {
-      throw ControlError.system("unlink", errno)
+    let failure = try withAddress(path) { address, length in
+      var existing = stat()
+      if lstat(path, &existing) == 0 {
+        guard existing.st_mode & S_IFMT == S_IFSOCK else {
+          throw ControlError.system("bind", EEXIST)
+        }
+        guard unlink(path) == 0 else { throw ControlError.system("unlink", errno) }
+      } else if errno != ENOENT {
+        throw ControlError.system("lstat", errno)
+      }
+      return bind(fd, address, length) == 0 ? 0 : errno
     }
-    let failure = try withAddress(path) { bind(fd, $0, $1) == 0 ? 0 : errno }
     guard failure == 0 else { throw ControlError.system("bind", failure) }
+    var listening = false
+    defer { if !listening { unlink(path) } }
     guard chmod(path, 0o600) == 0 else { throw ControlError.system("chmod", errno) }
     // nonblocking so a client that gives up before accept can't stall the queue
     let flags = fcntl(fd, F_GETFL)
@@ -59,6 +74,7 @@ public final class ControlServer: Sendable {
     guard Darwin.listen(fd, 16) == 0 else { throw ControlError.system("listen", errno) }
     var info = stat()
     guard stat(path, &info) == 0 else { throw ControlError.system("stat", errno) }
+    listening = true
     return info.st_ino
   }
 

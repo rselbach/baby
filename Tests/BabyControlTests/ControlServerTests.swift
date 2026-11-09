@@ -110,6 +110,49 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
 }
 
 @MainActor
+@Test func releasingTheServerRemovesTheSocket() async throws {
+  try await withSocketURL { url in
+    var server: ControlServer? = try ControlServer(url: url) { _ in ControlResponse() }
+    #expect(server != nil)
+    #expect(try await send(ControlRequest(command: .status), to: url) == ControlResponse())
+    server = nil
+    #expect(!FileManager.default.fileExists(atPath: url.path))
+  }
+}
+
+@MainActor
+@Test func preservesNonSocketFiles() async throws {
+  try await withSocketURL { url in
+    let files = FileManager.default
+    try files.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let content = Data("Troy Barnes".utf8)
+    try content.write(to: url)
+    #expect(throws: ControlError.system("bind", EEXIST)) {
+      let server = try ControlServer(url: url) { _ in ControlResponse() }
+      server.stop()
+    }
+    #expect(try Data(contentsOf: url) == content)
+  }
+}
+
+@MainActor
+@Test func preservesSymbolicLinksAtTheSocketPath() async throws {
+  try await withSocketURL { url in
+    let files = FileManager.default
+    try files.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let destination = url.deletingLastPathComponent().appending(path: "missing")
+    try files.createSymbolicLink(at: url, withDestinationURL: destination)
+    #expect(throws: ControlError.system("bind", EEXIST)) {
+      let server = try ControlServer(url: url) { _ in ControlResponse() }
+      server.stop()
+    }
+    #expect(try files.destinationOfSymbolicLink(atPath: url.path) == destination.path)
+  }
+}
+
+@MainActor
 @Test func reportsMissingBabyAsNotRunning() async throws {
   try await withSocketURL { url in
     #expect(throws: ControlError.notRunning) {
