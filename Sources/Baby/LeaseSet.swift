@@ -14,6 +14,32 @@ struct LeaseSet {
   /// The earliest deadline among the leases.
   var nextDeadline: Date? { leases.compactMap(\.deadline).min() }
 
+  /// What the leases need macOS to prevent. Any lease keeps the system
+  /// awake; only the user's own keeps the display on, so an agent's
+  /// overnight job doesn't light the screen.
+  var powerAssertions: Set<PowerAssertion> {
+    guard !leases.isEmpty else { return [] }
+    guard holdsUserLease else { return [.idleSystemSleep, .systemSleep] }
+    return Set(PowerAssertion.allCases)
+  }
+
+  /// What a plain click on the menu bar item does.
+  enum ClickAction: Equatable {
+    case holdUserLease
+    case releaseUserLease
+    /// Only agents hold leases: show who, since a click can neither turn
+    /// Baby on nor end leases the user didn't start.
+    case showMenu
+  }
+
+  /// A click toggles the user's own lease and never ends anyone else's.
+  var clickAction: ClickAction {
+    if holdsUserLease { return .releaseUserLease }
+    return leases.isEmpty ? .holdUserLease : .showMenu
+  }
+
+  private var holdsUserLease: Bool { leases.contains { $0.id == Self.userID } }
+
   /// Adds `lease`, replacing a lease with the same ID in place.
   mutating func hold(_ lease: Lease) {
     guard let index = leases.firstIndex(where: { $0.id == lease.id }) else {

@@ -5,7 +5,7 @@ import SwiftUI
 import os
 
 /// Owns the menu bar item, the leases that keep the Mac awake, and the
-/// caffeinate process that runs while any lease is held.
+/// power assertions held while any lease is.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   // carries every lease into the updated Baby, base64-encoded JSON
@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let log = Logger(subsystem: "com.rselbach.baby", category: "control")
   private var leases = LeaseSet()
   private var leaseItems: [NSMenuItem] = []
-  private var caffeinate: Process?
+  private let assertions = PowerAssertionHolder(name: "Baby is keeping the Mac awake")
   private var expiryTimer: Timer?
   private var processWatchers: [Int32: any DispatchSourceProcess] = [:]
   private var server: ControlServer?
@@ -186,6 +186,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     if !leases.isEmpty {
       leaseItems.append(.sectionHeader(title: "Keeping Awake For"))
       leaseItems.append(contentsOf: leases.leases.map(leaseMenuItem))
+      let releaseAll = NSMenuItem(
+        title: "Release All", action: #selector(releaseAllLeases), keyEquivalent: "")
+      releaseAll.target = self
+      leaseItems.append(releaseAll)
       leaseItems.append(.separator())
     }
     for (index, item) in leaseItems.enumerated() {
@@ -217,21 +221,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     server?.stop()
-    caffeinate?.terminate()
   }
 
-  // statusItemClicked toggles on left click and shows the menu on right,
-  // control, or option click.
+  // statusItemClicked toggles the user's lease on left click and shows the
+  // menu on right, control, or option click.
   @objc private func statusItemClicked() {
     let event = NSApp.currentEvent
     let wantsMenu =
       event?.type == .rightMouseUp
       || event?.modifierFlags.intersection([.control, .option]).isEmpty == false
-    guard wantsMenu else {
-      toggle()
+    guard !wantsMenu else {
+      showStatusMenu()
       return
     }
-    showStatusMenu()
+    switch leases.clickAction {
+    case .holdUserLease:
+      holdForUser(until: nil)
+    case .releaseUserLease:
+      leases.removeAll { $0.id == LeaseSet.userID }
+      apply()
+    case .showMenu:
+      showStatusMenu()
+    }
   }
 
   // Attaching the menu only for this click keeps left clicks as toggles.
@@ -325,15 +336,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     performUpdateAction()
   }
 
-  // toggle holds the user's lease while the Mac may sleep, and otherwise
-  // ends every lease: the user always wins over agents.
-  private func toggle() {
-    guard leases.isEmpty else {
-      leases.removeAll { _ in true }
-      apply()
-      return
-    }
-    holdForUser(until: nil)
+  @objc private func releaseAllLeases() {
+    leases.removeAll { _ in true }
+    apply()
   }
 
   @objc private func activateFor(_ sender: NSMenuItem) {
@@ -364,59 +369,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     NSAlert(error: error).runModal()
   }
 
-  // apply drops finished leases, then makes caffeinate, the expiry timer, the
-  // process watchers, and the menu bar item match the rest. If caffeinate
-  // can't start, it ends every lease and returns why.
+  // apply drops finished leases, then makes the power assertions, the expiry
+  // timer, the process watchers, and the menu bar item match the rest. If
+  // macOS refuses an assertion, it ends every lease and returns why.
   @discardableResult
   private func apply() -> (any Error)? {
     leases.removeFinished(now: Date(), isRunning: processIsRunning)
     var failure: (any Error)?
-    if leases.isEmpty {
-      stopCaffeinate()
-    } else if caffeinate == nil {
-      do {
-        try startCaffeinate()
-      } catch {
-        leases.removeAll { _ in true }
-        failure = error
-      }
+    do {
+      try assertions.hold(leases.powerAssertions)
+    } catch {
+      leases.removeAll { _ in true }
+      // releasing never fails
+      try? assertions.hold([])
+      failure = error
     }
     scheduleExpiry()
     watchProcesses()
     update()
     return failure
-  }
-
-  private func startCaffeinate() throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-    // -d display, -i idle, -s system (on AC power). -w ties caffeinate's
-    // lifetime to ours so a crash never leaves the Mac stuck awake.
-    process.arguments = [
-      "-dis", "-w", String(ProcessInfo.processInfo.processIdentifier),
-    ]
-    let id = ObjectIdentifier(process)
-    process.terminationHandler = { [weak self] _ in
-      Task { @MainActor in self?.caffeinateExited(id) }
-    }
-    try process.run()
-    caffeinate = process
-  }
-
-  private func stopCaffeinate() {
-    guard let running = caffeinate else { return }
-    caffeinate = nil
-    running.terminate()
-  }
-
-  // caffeinateExited ends every lease when caffeinate dies on its own.
-  private func caffeinateExited(_ id: ObjectIdentifier) {
-    guard let running = caffeinate, ObjectIdentifier(running) == id else {
-      return
-    }
-    caffeinate = nil
-    leases.removeAll { _ in true }
-    apply()
   }
 
   private func scheduleExpiry() {

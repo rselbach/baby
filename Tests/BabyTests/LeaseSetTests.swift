@@ -99,3 +99,25 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
   #expect(processIsRunning(1))
   #expect(!processIsRunning(Int32.max))
 }
+
+@Test func keepsTheDisplayOnOnlyForTheUser() {
+  var set = LeaseSet()
+  #expect(set.powerAssertions.isEmpty)
+  set.hold(Lease(id: "abed", label: "Abed"))
+  #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep])
+  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep, .displaySleep])
+  set.removeAll { $0.id == "abed" }
+  #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep, .displaySleep])
+}
+
+@Test func clicksToggleOnlyTheUsersLease() {
+  var set = LeaseSet()
+  #expect(set.clickAction == .holdUserLease)
+  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  #expect(set.clickAction == .releaseUserLease)
+  set.hold(Lease(id: "abed", label: "Abed"))
+  #expect(set.clickAction == .releaseUserLease)
+  set.removeAll { $0.id == LeaseSet.userID }
+  #expect(set.clickAction == .showMenu)
+}
