@@ -234,15 +234,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       showStatusMenu()
       return
     }
-    switch leases.clickAction {
-    case .holdUserLease:
+    // a click never ends an agent's lease, and the user can always add
+    // their own so the Mac stays awake after the agents finish
+    guard leases.holdsUserLease else {
       holdForUser(until: nil)
-    case .releaseUserLease:
-      leases.removeAll { $0.id == LeaseSet.userID }
-      apply()
-    case .showMenu:
-      showStatusMenu()
+      return
     }
+    leases.removeAll { $0.id == LeaseSet.userID }
+    apply()
   }
 
   // Attaching the menu only for this click keeps left clicks as toggles.
@@ -464,19 +463,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func update() {
-    let awake = !leases.isEmpty
     guard let button = statusItem.button else { return }
-    let image = NSImage(named: awake ? "baby-on" : "baby-off")
+    let indicator = leases.indicator
+    var image = NSImage(named: indicator == .asleep ? "baby-off" : "baby-on")
     image?.isTemplate = true
-    image?.accessibilityDescription = awake ? "Sleep prevented" : "Sleep allowed"
+    if indicator == .awakeForOthers {
+      image = image.map(Self.faded)
+    }
+    image?.accessibilityDescription =
+      switch indicator {
+      case .asleep: "Sleep allowed"
+      case .awakeForUser: "Sleep prevented"
+      case .awakeForOthers: "Sleep prevented by other apps"
+      }
     button.image = image
     button.toolTip = toolTip
+  }
+
+  // faded draws a template image at half strength. The result is still a
+  // template, so it follows the menu bar's appearance.
+  private static func faded(_ template: NSImage) -> NSImage {
+    let image = NSImage(size: template.size, flipped: false) { rect in
+      template.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.5)
+      return true
+    }
+    image.isTemplate = true
+    return image
   }
 
   private var toolTip: String {
     let others = leases.leases.filter { $0.id != LeaseSet.userID }.map(\.label)
     guard others.isEmpty else {
-      return "Baby: keeping your Mac awake for \(others.formatted(.list(type: .and)))"
+      let holders = (leases.holdsUserLease ? ["you"] : []) + others
+      return "Baby: keeping your Mac awake for \(holders.formatted(.list(type: .and)))"
     }
     guard let user = leases.leases.first else { return "Baby: sleep allowed" }
     guard let deadline = user.deadline else { return "Baby: keeping your Mac awake" }

@@ -23,22 +23,21 @@ struct LeaseSet {
     return Set(PowerAssertion.allCases)
   }
 
-  /// What a plain click on the menu bar item does.
-  enum ClickAction: Equatable {
-    case holdUserLease
-    case releaseUserLease
-    /// Only agents hold leases: show who, since a click can neither turn
-    /// Baby on nor end leases the user didn't start.
-    case showMenu
+  /// What the menu bar item shows.
+  enum Indicator: Equatable {
+    case asleep
+    case awakeForUser
+    /// Awake only for leases the user didn't start.
+    case awakeForOthers
   }
 
-  /// A click toggles the user's own lease and never ends anyone else's.
-  var clickAction: ClickAction {
-    if holdsUserLease { return .releaseUserLease }
-    return leases.isEmpty ? .holdUserLease : .showMenu
+  var indicator: Indicator {
+    if holdsUserLease { return .awakeForUser }
+    return leases.isEmpty ? .asleep : .awakeForOthers
   }
 
-  private var holdsUserLease: Bool { leases.contains { $0.id == Self.userID } }
+  /// Whether the user's own lease is held, whatever agents hold.
+  var holdsUserLease: Bool { leases.contains { $0.id == Self.userID } }
 
   /// Adds `lease`, replacing a lease with the same ID in place.
   mutating func hold(_ lease: Lease) {

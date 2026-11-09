@@ -111,13 +111,22 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
   #expect(set.powerAssertions == [.idleSystemSleep, .systemSleep, .displaySleep])
 }
 
-@Test func clicksToggleOnlyTheUsersLease() {
+@Test func tracksTheUsersLeaseApartFromAgents() {
   var set = LeaseSet()
-  #expect(set.clickAction == .holdUserLease)
-  set.hold(Lease(id: LeaseSet.userID, label: "You"))
-  #expect(set.clickAction == .releaseUserLease)
+  #expect(!set.holdsUserLease)
   set.hold(Lease(id: "abed", label: "Abed"))
-  #expect(set.clickAction == .releaseUserLease)
-  set.removeAll { $0.id == LeaseSet.userID }
-  #expect(set.clickAction == .showMenu)
+  #expect(!set.holdsUserLease)
+  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  #expect(set.holdsUserLease)
+  set.removeAll { $0.id == "abed" }
+  #expect(set.holdsUserLease)
+}
+
+@Test func indicatesWhoKeepsTheMacAwake() {
+  var set = LeaseSet()
+  #expect(set.indicator == .asleep)
+  set.hold(Lease(id: "abed", label: "Abed"))
+  #expect(set.indicator == .awakeForOthers)
+  set.hold(Lease(id: LeaseSet.userID, label: "You"))
+  #expect(set.indicator == .awakeForUser)
 }
