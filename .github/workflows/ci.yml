@@ -23,6 +23,7 @@ jobs:
       - name: Test release tooling and website
         run: |
           python3 Tests/BuildTests/test_versions.py
+          python3 Tests/DeploymentTests/test_deploy_site.py
           node --test Tests/SiteTests/*.test.mjs
 
       - name: Build app bundle
