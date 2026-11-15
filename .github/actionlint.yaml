@@ -1,4 +1,4 @@
-# GitHub's macOS 27 image (public preview) is newer than actionlint's
+# GitHub's macOS 27 image is newer than actionlint's
 # built-in runner list
 self-hosted-runner:
   labels:
