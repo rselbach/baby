@@ -21,7 +21,12 @@ public enum ControlClient {
     default:
       throw ControlError.system("connect", failure)
     }
-    try writeMessage(fd, ControlCoding.encoder().encode(request))
+    do {
+      try writeMessage(fd, ControlCoding.encoder().encode(request))
+    } catch ControlError.system(_, let code) where code == EPIPE {
+      // a busy Baby answers and hangs up without reading; its reply is
+      // still waiting to be read
+    }
     let reply = try readMessage(fd)
     do {
       return try ControlCoding.decoder().decode(ControlResponse.self, from: reply)

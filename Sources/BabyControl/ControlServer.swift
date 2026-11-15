@@ -7,10 +7,17 @@ public final class ControlServer: Sendable {
   private let source: any DispatchSourceRead
   private let stopped = DispatchGroup()
 
+  /// How many connections are served at once by default. Each waits up to
+  /// five seconds for its request on its own thread, so this bounds how many
+  /// threads a misbehaving client can tie up.
+  public static let defaultMaximumConnections = 8
+
   /// Starts listening at `url`, replacing any socket an earlier Baby left
-  /// there. `handler` runs on the main actor once per request.
+  /// there. `handler` runs on the main actor once per request. Connections
+  /// beyond `maximumConnections` at once are answered that Baby is busy.
   public init(
-    url: URL, handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
+    url: URL, maximumConnections: Int = defaultMaximumConnections,
+    handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
   ) throws {
     let path = url.path
     let directory = url.deletingLastPathComponent().path
@@ -41,7 +48,8 @@ public final class ControlServer: Sendable {
     }
     source = DispatchSource.makeReadSource(
       fileDescriptor: fd, queue: DispatchQueue(label: "com.rselbach.baby.control"))
-    source.setEventHandler { Self.accept(on: fd, handler: handler) }
+    let slots = DispatchSemaphore(value: maximumConnections)
+    source.setEventHandler { Self.accept(on: fd, slots: slots, handler: handler) }
     let stopped = self.stopped
     stopped.enter()
     source.setCancelHandler {
@@ -110,11 +118,34 @@ public final class ControlServer: Sendable {
   }
 
   private static func accept(
-    on fd: Int32, handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
+    on fd: Int32, slots: DispatchSemaphore,
+    handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
   ) {
     let client = Darwin.accept(fd, nil, nil)
     guard client >= 0 else { return }
-    DispatchQueue.global().async { serve(client, handler: handler) }
+    guard slots.wait(timeout: .now()) == .success else {
+      refuse(client)
+      return
+    }
+    DispatchQueue.global().async {
+      defer { slots.signal() }
+      serve(client, handler: handler)
+    }
+  }
+
+  // refuse tells a client over the connection limit to try again, without
+  // reading its request or blocking the accept queue.
+  private static func refuse(_ client: Int32) {
+    defer { close(client) }
+    var uid = uid_t(0)
+    var gid = gid_t(0)
+    guard getpeereid(client, &uid, &gid) == 0, uid == getuid(),
+      (try? configure(client, timeout: 1)) != nil,
+      let reply = try? ControlCoding.encoder().encode(
+        ControlResponse(error: "Baby is busy. Try again in a moment."))
+    else { return }
+    // the reply fits in an empty socket buffer, so this write doesn't block
+    try? writeMessage(client, reply)
   }
 
   private static func serve(

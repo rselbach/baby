@@ -35,6 +35,36 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
   }.value
 }
 
+// connectIdle opens a connection that never sends a request.
+private func connectIdle(to url: URL) throws -> Int32 {
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+  #expect(fd >= 0)
+  let status = try withAddress(url.path) { connect(fd, $0, $1) }
+  #expect(status == 0)
+  return fd
+}
+
+@MainActor
+@Test func turnsAwayConnectionsBeyondTheLimit() async throws {
+  try await withSocketURL { url in
+    let server = try ControlServer(url: url, maximumConnections: 2) { _ in ControlResponse() }
+    defer { server.stop() }
+    // connections are accepted in order, so these two hold both slots
+    let idle = try (0..<2).map { _ in try connectIdle(to: url) }
+    let busy = try await send(ControlRequest(command: .status), to: url)
+    #expect(busy.error == "Baby is busy. Try again in a moment.")
+
+    // the slots free up as the idle connections close
+    idle.forEach { close($0) }
+    var response = busy
+    for _ in 0..<50 where response.error != nil {
+      try await Task.sleep(for: .milliseconds(100))
+      response = try await send(ControlRequest(command: .status), to: url)
+    }
+    #expect(response == ControlResponse())
+  }
+}
+
 @MainActor
 @Test func answersRequestsOnTheMainActor() async throws {
   try await withSocketURL { url in
