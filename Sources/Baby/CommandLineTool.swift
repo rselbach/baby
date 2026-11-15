@@ -12,18 +12,26 @@ enum CommandLineTool {
     return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
   }
 
-  /// Reports whether the link points at `helper`.
-  static func isInstalled(_ helper: URL) -> Bool {
+  /// Reports whether `link` points at `helper`.
+  static func isInstalled(_ helper: URL, at link: URL = CommandLineTool.link) -> Bool {
     (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == helper.path
   }
 
-  /// Links `helper` into ~/.local/bin, replacing an earlier link but never
-  /// another file.
-  static func install(_ helper: URL) throws {
+  /// Links `helper` at `link`, replacing an earlier link to a Baby helper but
+  /// never another file or a link to anything else.
+  static func install(_ helper: URL, at link: URL = CommandLineTool.link) throws {
     let files = FileManager.default
     try files.createDirectory(
       at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
-    if (try? files.destinationOfSymbolicLink(atPath: link.path)) != nil {
+    if let destination = try? files.destinationOfSymbolicLink(atPath: link.path) {
+      guard isBabyHelper(destination) else {
+        throw CocoaError(
+          .fileWriteFileExists,
+          userInfo: [
+            NSLocalizedDescriptionKey:
+              "\(link.path) links to \(destination). Remove it to install Baby's tool."
+          ])
+      }
       try files.removeItem(at: link)
     } else if files.fileExists(atPath: link.path) {
       throw CocoaError(
@@ -34,5 +42,14 @@ enum CommandLineTool {
         ])
     }
     try files.createSymbolicLink(at: link, withDestinationURL: helper)
+  }
+
+  /// Whether `path` names the tool inside some app bundle, as in
+  /// /Applications/Baby.app/Contents/Helpers/baby, wherever that app lives.
+  static func isBabyHelper(_ path: String) -> Bool {
+    let components = path.split(separator: "/").map(String.init)
+    guard components.count >= 4 else { return false }
+    return components.suffix(3) == ["Contents", "Helpers", "baby"]
+      && components[components.count - 4].hasSuffix(".app")
   }
 }

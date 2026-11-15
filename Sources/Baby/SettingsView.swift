@@ -166,6 +166,18 @@ struct SettingsView: View {
           .font(.callout)
           .foregroundStyle(.secondary)
       }
+      // macOS doesn't put ~/.local/bin on PATH, and Baby can't see the
+      // shell's PATH to tell whether the user already has
+      Text(
+        """
+        If your shell can't find baby, add ~/.local/bin to your PATH, as in \
+        `export PATH="$HOME/.local/bin:$PATH"` in ~/.zshrc.
+        """
+      )
+      .font(.callout)
+      .foregroundStyle(.secondary)
+      .textSelection(.enabled)
+      .fixedSize(horizontal: false, vertical: true)
       if let toolError {
         Text(toolError)
           .font(.callout)
