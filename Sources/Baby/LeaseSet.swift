@@ -13,10 +13,22 @@ struct LeaseSet {
 
   init() {}
 
-  init(restoring data: Data) throws {
+  /// Restores the leases an earlier Baby passed along. Throws only when
+  /// `data` isn't a list of leases at all; a lease that can't be held is
+  /// skipped, and why goes in `rejected`, so one bad lease doesn't drop the rest.
+  init(restoring data: Data, rejected: inout [String]) throws {
     for lease in try ControlCoding.decoder().decode([Lease].self, from: data) {
-      try hold(lease)
+      do {
+        try hold(lease)
+      } catch {
+        rejected.append("\(lease.id): \(error.message)")
+      }
     }
+  }
+
+  init(restoring data: Data) throws {
+    var rejected: [String] = []
+    try self.init(restoring: data, rejected: &rejected)
   }
 
   var isEmpty: Bool { leases.isEmpty }
@@ -117,10 +129,26 @@ extension Lease {
         throw LeaseRequestError(message: "Process \(pid) is not running.")
       }
     }
-    let label = String(
-      (request.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+    let label = Self.truncatedLabel(request.label ?? "")
     self.init(id: id, label: label.isEmpty ? id : label, deadline: deadline, pid: request.pid)
     try validate()
+  }
+
+  /// Trims `text` and keeps as many whole characters as fit in a label: 64
+  /// characters and 256 UTF-8 bytes. A first character too large on its own
+  /// leaves the label empty.
+  static func truncatedLabel(_ text: String) -> String {
+    var label = ""
+    var characters = 0
+    var bytes = 0
+    for character in text.trimmingCharacters(in: .whitespacesAndNewlines) {
+      let size = character.utf8.count
+      guard characters < 64, bytes + size <= 256 else { break }
+      label.append(character)
+      characters += 1
+      bytes += size
+    }
+    return label
   }
 
   fileprivate func validate() throws(LeaseRequestError) {

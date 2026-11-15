@@ -150,13 +150,21 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
   #expect(set.leases.count == 64)
 }
 
-@Test func rejectsLabelsWithUnboundedCombiningCharacters() {
-  let label = "a" + String(repeating: "\u{0301}", count: 300)
-  #expect(label.count == 1)
-  #expect(throws: LeaseRequestError.self) {
-    try Lease(
-      holding: ControlRequest(command: .hold, label: label), now: now, isRunning: { _ in true })
-  }
+@Test func truncatesLabelsToTheirByteLimit() throws {
+  let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+  #expect(family.count == 1 && family.utf8.count == 25)
+  let wide = try Lease(
+    holding: ControlRequest(command: .hold, id: "troy", label: String(repeating: family, count: 64)),
+    now: now, isRunning: { _ in true })
+  #expect(wide.label == String(repeating: family, count: 10))
+
+  // a single character too large for a label leaves the ID as the label
+  let unbounded = "a" + String(repeating: "\u{0301}", count: 300)
+  #expect(unbounded.count == 1)
+  let lease = try Lease(
+    holding: ControlRequest(command: .hold, id: "troy", label: unbounded), now: now,
+    isRunning: { _ in true })
+  #expect(lease.label == "troy")
 }
 
 @Test func fullLeaseSetsFitTheStatusAndRelaunchFormats() throws {
@@ -177,15 +185,39 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
   #expect(try LeaseSet(restoring: data).leases == set.leases)
 }
 
-@Test func validatesRestoredLeaseState() throws {
-  let cases = [
-    [Lease(id: "troy", label: "Troy", pid: 0)],
-    [Lease(id: "../troy", label: "Troy")],
-    [Lease(id: "troy", label: String(repeating: "a", count: 65))],
-    (0...LeaseSet.maximumAgentLeases).map { Lease(id: "troy-\($0)", label: "Troy") },
+@Test func skipsInvalidLeasesWhenRestoring() throws {
+  let cases: [(leases: [Lease], kept: Int)] = [
+    ([Lease(id: "troy", label: "Troy", pid: 0)], 0),
+    ([Lease(id: "../troy", label: "Troy")], 0),
+    ([Lease(id: "troy", label: String(repeating: "a", count: 65))], 0),
+    ((0...LeaseSet.maximumAgentLeases).map { Lease(id: "troy-\($0)", label: "Troy") },
+      LeaseSet.maximumAgentLeases),
   ]
-  for leases in cases {
+  for (leases, kept) in cases {
     let data = try ControlCoding.encoder().encode(leases)
-    #expect(throws: LeaseRequestError.self) { try LeaseSet(restoring: data) }
+    var rejected: [String] = []
+    let set = try LeaseSet(restoring: data, rejected: &rejected)
+    #expect(set.leases.count == kept)
+    #expect(rejected.count == leases.count - kept)
+  }
+}
+
+@Test func keepsValidLeasesBesideAnInvalidOne() throws {
+  let leases = [
+    Lease(id: "troy", label: "Troy"),
+    Lease(id: "abed", label: "Abed", pid: -1),
+    Lease(id: LeaseSet.userID, label: "You"),
+  ]
+  var rejected: [String] = []
+  let set = try LeaseSet(
+    restoring: try ControlCoding.encoder().encode(leases), rejected: &rejected)
+  #expect(set.leases.map(\.id) == ["troy", LeaseSet.userID])
+  #expect(rejected.count == 1)
+  #expect(rejected.first?.hasPrefix("abed:") == true)
+}
+
+@Test func rejectsRestoreDataThatIsNotALeaseList() {
+  for data in [Data(), Data("{}".utf8), Data("[{\"id\": 3}]".utf8)] {
+    #expect(throws: DecodingError.self) { try LeaseSet(restoring: data) }
   }
 }

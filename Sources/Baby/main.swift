@@ -8,8 +8,6 @@ import os
 /// power assertions held while any lease is.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-  // carries every lease into the updated Baby, base64-encoded JSON
-  private static let leasesPrefix = "--leases="
   private let statusItem = NSStatusBar.system.statusItem(
     withLength: NSStatusItem.squareLength)
   private let menu = NSMenu()
@@ -26,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var processWatchers: [Int32: any DispatchSourceProcess] = [:]
   private var server: ControlServer?
   private var settingsWindow: NSWindow?
+  private var menuIsOpen = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     guard startServer() else {
@@ -105,35 +104,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     updater?.start()
   }
 
-  // Relaunch arguments preserve the live state across an update,
-  // overriding the normal launch preference. Earlier Babys relaunch with
-  // --awake or --awake-until=; newer ones pass every lease in --leases=.
   private func restoreLaunchState() {
-    let args = CommandLine.arguments
-    if let argument = args.first(where: { $0.hasPrefix(Self.leasesPrefix) }) {
-      let encoded = argument.dropFirst(Self.leasesPrefix.count)
+    let state = LaunchState(
+      arguments: CommandLine.arguments,
+      activateOnLaunch: UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch))
+    switch state {
+    case .leases(let data):
       do {
-        // invalid base64 decodes to nothing, which the JSON decoder rejects
-        let data = Data(base64Encoded: String(encoded)) ?? Data()
-        leases = try LeaseSet(restoring: data)
+        var rejected: [String] = []
+        leases = try LeaseSet(restoring: data, rejected: &rejected)
+        for reason in rejected {
+          log.error("skipped a lease while restoring: \(reason, privacy: .public)")
+        }
       } catch {
         log.error("could not restore leases: \(error.localizedDescription, privacy: .public)")
       }
       presentFailure(apply())
-      return
-    }
-    let deadlinePrefix = "--awake-until="
-    if let argument = args.first(where: { $0.hasPrefix(deadlinePrefix) }) {
-      if let timestamp = TimeInterval(argument.dropFirst(deadlinePrefix.count)),
-        timestamp.isFinite
-      {
-        holdForUser(until: Date(timeIntervalSince1970: timestamp))
-      }
-    } else if args.contains("--awake")
-      || (!args.contains("--asleep")
-        && UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch))
-    {
-      holdForUser(until: nil)
+    case .awake(let deadline):
+      holdForUser(until: deadline)
+    case .asleep:
+      break
     }
   }
 
@@ -186,6 +176,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func menuNeedsUpdate(_ menu: NSMenu) {
+    refreshLeaseItems()
+    durations.removeAllItems()
+    for minutes in [0] + presets.minutes {
+      let title = minutes == 0 ? "Permanent (default)" : ActivationPresets.title(for: minutes)
+      let item = NSMenuItem(
+        title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
+      item.target = self
+      item.tag = minutes * 60
+      durations.addItem(item)
+    }
+    guard let updater else { return }
+    updateItem.title = updater.state.actionTitle
+    updateItem.isEnabled = updater.state.actionEnabled
+  }
+
+  func menuWillOpen(_ menu: NSMenu) {
+    menuIsOpen = true
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    menuIsOpen = false
+  }
+
+  // refreshLeaseItems rebuilds the menu's lease section from the leases. It
+  // runs as the menu opens and whenever the leases change while it is open.
+  private func refreshLeaseItems() {
     for item in leaseItems {
       menu.removeItem(item)
     }
@@ -202,18 +218,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     for (index, item) in leaseItems.enumerated() {
       menu.insertItem(item, at: index)
     }
-    durations.removeAllItems()
-    for minutes in [0] + presets.minutes {
-      let title = minutes == 0 ? "Permanent (default)" : ActivationPresets.title(for: minutes)
-      let item = NSMenuItem(
-        title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
-      item.target = self
-      item.tag = minutes * 60
-      durations.addItem(item)
-    }
-    guard let updater else { return }
-    updateItem.title = updater.state.actionTitle
-    updateItem.isEnabled = updater.state.actionEnabled
   }
 
   // A staged update is installed on the way out, so the next launch runs it.
@@ -284,13 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .ready:
       Task {
         if await updater.restartToUpdate(launchArguments: {
-          guard !self.leases.isEmpty else { return ["--asleep"] }
-          do {
-            let data = try ControlCoding.encoder().encode(self.leases.leases)
-            return [Self.leasesPrefix + data.base64EncodedString()]
-          } catch {
-            return ["--awake"]
-          }
+          LaunchState.relaunchArguments(for: self.leases.leases)
         }) {
           NSApp.terminate(nil)
         } else {
@@ -489,6 +487,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       }
     button.image = image
     button.toolTip = toolTip
+    // an agent can take or release a lease while the user reads the menu
+    if menuIsOpen { refreshLeaseItems() }
   }
 
   // faded draws a template image at half strength. The result is still a
