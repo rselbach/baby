@@ -4,65 +4,9 @@ import BabyControl
 import Darwin
 import Foundation
 
-struct CLIError: LocalizedError {
-  let message: String
-  var errorDescription: String? { message }
-}
-
 func fail(_ message: String, status: Int32 = 1) -> Never {
   FileHandle.standardError.write(Data("baby: \(message)\n".utf8))
   exit(status)
-}
-
-// send sends request to Baby, opening it first when launch is set and Baby
-// isn't running.
-func send(_ request: ControlRequest, launch: Bool) throws -> ControlResponse {
-  let response: ControlResponse
-  do {
-    response = try ControlClient.send(request)
-  } catch ControlError.notRunning where launch {
-    try openBaby()
-    response = try waitForBaby(request)
-  }
-  if let error = response.error { throw CLIError(message: error) }
-  return response
-}
-
-// openBaby opens the Baby.app this tool ships in, or the installed Baby,
-// without activating it or its activate-on-launch setting.
-func openBaby() throws {
-  let process = Process()
-  process.executableURL = URL(filePath: "/usr/bin/open")
-  var arguments = ["-g"]
-  if let app = containingApp() {
-    arguments.append(app.path)
-  } else {
-    arguments += ["-b", "com.rselbach.baby"]
-  }
-  process.arguments = arguments + ["--args", "--asleep"]
-  try process.run()
-  process.waitUntilExit()
-  guard process.terminationStatus == 0 else { throw CLIError(message: "could not open Baby") }
-}
-
-// containingApp returns the app when this tool runs from X.app/Contents/Helpers.
-func containingApp() -> URL? {
-  guard let path = Bundle.main.executablePath else { return nil }
-  let helpers = URL(filePath: path).resolvingSymlinksInPath().deletingLastPathComponent()
-  let app = helpers.deletingLastPathComponent().deletingLastPathComponent()
-  guard helpers.lastPathComponent == "Helpers", app.pathExtension == "app" else { return nil }
-  return app
-}
-
-func waitForBaby(_ request: ControlRequest) throws -> ControlResponse {
-  for _ in 0..<100 {
-    do {
-      return try ControlClient.send(request)
-    } catch ControlError.notRunning {
-      usleep(100_000)
-    }
-  }
-  throw CLIError(message: "Baby did not start")
 }
 
 // processName returns the executable name of pid, if it can be read.
