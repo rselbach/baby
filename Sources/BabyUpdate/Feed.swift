@@ -11,9 +11,15 @@ public enum UpdateConfig {
   public static let bundleIdentifier = "com.rselbach.baby"
   /// The only channel Baby follows.
   public static let channel = "stable"
-  /// The raw Ed25519 public key, base64, that signs the feed. Its private
-  /// half is the shared SPARKLE_EDDSA_PRIVATE_KEY deployment secret.
-  public static let publicKey = "2obyIySbPw8xSuXQwzSw2sCbOixUww08jk95se82unc="
+  /// The raw Ed25519 public key, base64, behind every feed's `signature`
+  /// field. Its private half is the shared SPARKLE_EDDSA_PRIVATE_KEY
+  /// deployment secret. Builds released before Baby had a key of its own
+  /// trust only this one, so every feed keeps this signature for them.
+  public static let legacyPublicKey = "2obyIySbPw8xSuXQwzSw2sCbOixUww08jk95se82unc="
+  /// The raw Ed25519 public keys, base64, this build trusts to sign the
+  /// feed. scripts/rotate-feed-key.sh replaces the shared legacy key here
+  /// with one used for nothing else, kept in the BABY_FEED_SIGNING_KEY secret.
+  public static let publicKeys = [legacyPublicKey]
   /// The prefix every artifact URL must start with.
   public static let artifactPrefix = "https://github.com/rselbach/baby/releases/download/"
   /// The prefix a release notes URL must start with.
@@ -46,9 +52,12 @@ public enum FeedError: LocalizedError, Equatable {
   case badSignature
   case invalid(String)
   case rollback(seen: Int, got: Int)
+  case expired
 
   public var errorDescription: String? {
     switch self {
+    case .expired:
+      "The update feed has expired. Check that your Mac's date and time are correct."
     case .tooLarge: "The update feed is too large."
     case .malformed: "The update feed is malformed."
     case .badSignature: "The update feed's signature is not valid."
@@ -71,10 +80,14 @@ public struct Release: Codable, Equatable, Sendable {
   public var publishedAt: String
   public var notesURL: String?
   public var artifacts: [Artifact]
+  /// When clients stop trusting this feed, so a feed withheld or replayed
+  /// for too long fails instead of hiding newer releases. Absent in feeds
+  /// signed before expiry existed; a refresh re-signs a release with a later one.
+  public var expiresAt: String?
 
   public init(
     version: String, build: Int, publishedAt: String, notesURL: String?,
-    artifacts: [Artifact]
+    artifacts: [Artifact], expiresAt: String? = nil
   ) {
     self.schema = 1
     self.app = UpdateConfig.bundleIdentifier
@@ -84,12 +97,14 @@ public struct Release: Codable, Equatable, Sendable {
     self.publishedAt = publishedAt
     self.notesURL = notesURL
     self.artifacts = artifacts
+    self.expiresAt = expiresAt
   }
 
   enum CodingKeys: String, CodingKey {
     case schema, app, channel, version, build, artifacts
     case publishedAt = "published_at"
     case notesURL = "notes_url"
+    case expiresAt = "expires_at"
   }
 }
 
@@ -128,11 +143,18 @@ public enum Decision: Equatable, Sendable {
   case install(Release, Artifact)
 }
 
-/// The signed feed envelope: a base64 release payload and a detached
-/// Ed25519 signature over the signing context followed by the payload bytes.
+/// The signed feed envelope: a base64 release payload and detached Ed25519
+/// signatures over the signing context followed by the payload bytes.
+/// `signature` is by the legacy key, the only field older builds read;
+/// `signatures` holds the rest. A feed is valid when any of them verifies
+/// with a key the build trusts.
 public enum Feed {
   /// Feeds larger than this are rejected unread.
   public static let maxBytes = 64 * 1024
+  /// How long a newly signed feed stays valid.
+  public static let validity: TimeInterval = 90 * 24 * 60 * 60
+  /// A refresh re-signs the live feed once less than this much time is left.
+  public static let refreshMargin: TimeInterval = 60 * 24 * 60 * 60
   // keeps a feed signature from being valid as any other message signed
   // with the shared key, such as a Sparkle archive signature or another
   // app's feed
@@ -141,91 +163,185 @@ public enum Feed {
   private struct Envelope: Codable {
     var payload: String
     var signature: String
+    var signatures: [String]?
   }
 
-  /// The compiled-in feed verification key.
-  public static func publicKey() throws -> Curve25519.Signing.PublicKey {
-    guard let raw = Data(base64Encoded: UpdateConfig.publicKey) else {
-      throw FeedError.badSignature
-    }
+  /// The compiled-in feed verification keys.
+  public static func publicKeys() throws -> [Curve25519.Signing.PublicKey] {
+    try UpdateConfig.publicKeys.map(publicKey(base64:))
+  }
+
+  /// The key older builds trust, which signs every feed's `signature`.
+  public static func legacyPublicKey() throws -> Curve25519.Signing.PublicKey {
+    try publicKey(base64: UpdateConfig.legacyPublicKey)
+  }
+
+  static func publicKey(base64: String) throws -> Curve25519.Signing.PublicKey {
+    guard let raw = Data(base64Encoded: base64) else { throw FeedError.badSignature }
     return try Curve25519.Signing.PublicKey(rawRepresentation: raw)
   }
 
-  /// Verifies a feed's signature, then parses and validates its release.
+  /// Verifies a feed's signature with `publicKey`, or the compiled-in keys,
+  /// then parses and validates its release. It doesn't check expiry, so
+  /// tooling can still read an expired live feed; see ``Release/checkFresh(at:)``.
   public static func open(
     _ data: Data, publicKey: Curve25519.Signing.PublicKey? = nil
   ) throws -> Release {
+    try open(data, publicKeys: publicKey.map { [$0] } ?? Self.publicKeys())
+  }
+
+  /// Verifies that one of the feed's signatures is by one of `publicKeys`,
+  /// then parses and validates its release.
+  public static func open(
+    _ data: Data, publicKeys: [Curve25519.Signing.PublicKey]
+  ) throws -> Release {
     guard data.count <= maxBytes else { throw FeedError.tooLarge }
     guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-      let payload = Data(base64Encoded: envelope.payload),
-      let signature = Data(base64Encoded: envelope.signature)
+      let payload = Data(base64Encoded: envelope.payload)
     else { throw FeedError.malformed }
-    let key = try publicKey ?? Self.publicKey()
-    guard signature.count == 64,
-      key.isValidSignature(signature, for: signingContext + payload)
-    else { throw FeedError.badSignature }
+    var signatures: [Data] = []
+    for text in [envelope.signature] + (envelope.signatures ?? []) {
+      guard let signature = Data(base64Encoded: text) else { throw FeedError.malformed }
+      signatures.append(signature)
+    }
+    let message = signingContext + payload
+    let verified = signatures.contains { signature in
+      signature.count == 64
+        && publicKeys.contains { $0.isValidSignature(signature, for: message) }
+    }
+    guard verified else { throw FeedError.badSignature }
     guard let release = try? JSONDecoder().decode(Release.self, from: payload)
     else { throw FeedError.malformed }
     try release.validate()
     return release
   }
 
-  /// Signs a release into a feed envelope.
+  /// Signs a release into a feed envelope with one key.
   public static func seal(
     _ release: Release, privateKey: Curve25519.Signing.PrivateKey
   ) throws -> Data {
+    try seal(release, privateKeys: [privateKey])
+  }
+
+  /// Signs a release into a feed envelope. The first key signs `signature`,
+  /// which older builds read, so it must be the legacy key for a real feed;
+  /// the others sign `signatures`.
+  public static func seal(
+    _ release: Release, privateKeys: [Curve25519.Signing.PrivateKey]
+  ) throws -> Data {
+    guard let first = privateKeys.first else { throw FeedError.badSignature }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     let payload = try encoder.encode(release)
-    let signature = try privateKey.signature(for: signingContext + payload)
+    let message = signingContext + payload
+    let rest = try privateKeys.dropFirst().map {
+      try $0.signature(for: message).base64EncodedString()
+    }
     let envelope = Envelope(
       payload: payload.base64EncodedString(),
-      signature: signature.base64EncodedString())
+      signature: try first.signature(for: message).base64EncodedString(),
+      signatures: rest.isEmpty ? nil : rest)
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     return try encoder.encode(envelope) + Data("\n".utf8)
   }
 
   /// Signs a release to succeed `live` (if any), reusing the verified `live`
-  /// feed verbatim on an idempotent rerun when `publishedAt` was not pinned.
+  /// feed on an idempotent rerun when `publishedAt` was not pinned. A rerun
+  /// re-signs `live` with a later expiry only if it is close to expiring.
   public static func publish(
     version: String, build: Int, publishedAt: String? = nil, notesURL: String?,
     artifacts: [Artifact], privateKey: Curve25519.Signing.PrivateKey,
-    after live: Data? = nil, publicKey: Curve25519.Signing.PublicKey? = nil
+    after live: Data? = nil, publicKey: Curve25519.Signing.PublicKey? = nil,
+    now: Date = Date()
   ) throws -> (feed: Data, release: Release) {
-    let key = try publicKey ?? Self.publicKey()
-    guard privateKey.publicKey.rawRepresentation == key.rawRepresentation else {
-      throw FeedError.badSignature
-    }
-    let current = try live.map { try open($0, publicKey: key) }
+    try publish(
+      version: version, build: build, publishedAt: publishedAt, notesURL: notesURL,
+      artifacts: artifacts, privateKeys: [privateKey], after: live,
+      publicKeys: publicKey.map { [$0] } ?? Self.publicKeys(), now: now)
+  }
+
+  /// Signs a release with every key in `privateKeys`, which must cover all
+  /// of `publicKeys`, to succeed `live` (if any).
+  public static func publish(
+    version: String, build: Int, publishedAt: String? = nil, notesURL: String?,
+    artifacts: [Artifact], privateKeys: [Curve25519.Signing.PrivateKey],
+    after live: Data? = nil, publicKeys: [Curve25519.Signing.PublicKey],
+    now: Date = Date()
+  ) throws -> (feed: Data, release: Release) {
+    try requireSigners(privateKeys, for: publicKeys)
+    let current = try live.map { try open($0, publicKeys: publicKeys) }
     if let live, let current, publishedAt == nil {
       let candidate = Release(
         version: version, build: build, publishedAt: current.publishedAt,
-        notesURL: notesURL, artifacts: artifacts)
+        notesURL: notesURL, artifacts: artifacts, expiresAt: current.expiresAt)
       if candidate == current {
-        return (live, current)
+        return try refresh(
+          live, privateKeys: privateKeys, publicKeys: publicKeys, now: now)
       }
     }
     let release = Release(
       version: version, build: build,
-      publishedAt: publishedAt ?? ISO8601DateFormatter().string(from: Date()),
-      notesURL: notesURL, artifacts: artifacts)
+      publishedAt: publishedAt ?? ISO8601DateFormatter().string(from: now),
+      notesURL: notesURL, artifacts: artifacts,
+      expiresAt: ISO8601DateFormatter().string(from: now.addingTimeInterval(validity)))
     try release.validate()
     if let current {
       try release.verifySupersedes(current)
     }
-    let feed = try seal(release, privateKey: privateKey)
-    guard try open(feed, publicKey: key) == release else {
+    let feed = try seal(release, privateKeys: privateKeys)
+    guard try open(feed, publicKeys: publicKeys) == release else {
       throw FeedError.malformed
     }
     return (feed, release)
   }
+
+  /// Returns `live` verbatim while it has more than ``refreshMargin`` left,
+  /// and otherwise re-signs the same release to expire ``validity`` from now.
+  public static func refresh(
+    _ live: Data, privateKeys: [Curve25519.Signing.PrivateKey],
+    publicKeys: [Curve25519.Signing.PublicKey], now: Date = Date()
+  ) throws -> (feed: Data, release: Release) {
+    try requireSigners(privateKeys, for: publicKeys)
+    let current = try open(live, publicKeys: publicKeys)
+    if let expiry = current.expiryDate, expiry.timeIntervalSince(now) > refreshMargin {
+      return (live, current)
+    }
+    var release = current
+    release.expiresAt = ISO8601DateFormatter().string(from: now.addingTimeInterval(validity))
+    try release.validate()
+    try release.verifySupersedes(current)
+    let feed = try seal(release, privateKeys: privateKeys)
+    guard try open(feed, publicKeys: publicKeys) == release else {
+      throw FeedError.malformed
+    }
+    return (feed, release)
+  }
+
+  // requireSigners fails early when the feed wouldn't verify for this build.
+  private static func requireSigners(
+    _ privateKeys: [Curve25519.Signing.PrivateKey],
+    for publicKeys: [Curve25519.Signing.PublicKey]
+  ) throws {
+    let signers = Set(privateKeys.map(\.publicKey.rawRepresentation))
+    guard !publicKeys.isEmpty,
+      publicKeys.allSatisfy({ signers.contains($0.rawRepresentation) })
+    else { throw FeedError.badSignature }
+  }
 }
 
 extension Release {
-  /// Rejects `self` unless it equals `current` or advances `build` without
-  /// regressing `version`.
+  /// Rejects `self` unless it equals `current`, re-signs it with a later
+  /// expiry, or advances `build` without regressing `version`.
   public func verifySupersedes(_ current: Release) throws {
     if self == current { return }
+    if build == current.build {
+      var unexpiring = self
+      unexpiring.expiresAt = current.expiresAt
+      guard unexpiring == current, let expiry = expiryDate,
+        expiry >= current.expiryDate ?? .distantPast
+      else { throw FeedError.rollback(seen: current.build, got: build) }
+      return
+    }
     guard build > current.build else {
       throw FeedError.rollback(seen: current.build, got: build)
     }
@@ -244,8 +360,13 @@ extension Release {
     guard channel == UpdateConfig.channel else { throw FeedError.invalid("channel") }
     guard Self.isValidVersion(version) else { throw FeedError.invalid("version") }
     guard build > 0 else { throw FeedError.invalid("build") }
-    guard Self.isValidTimestamp(publishedAt) else {
+    guard let published = Self.date(publishedAt) else {
       throw FeedError.invalid("published_at")
+    }
+    if let expiresAt {
+      guard let expiry = Self.date(expiresAt), expiry > published else {
+        throw FeedError.invalid("expires_at")
+      }
     }
     if let notesURL {
       guard Self.isSafeURL(notesURL, prefix: UpdateConfig.notesPrefix) else {
@@ -256,6 +377,16 @@ extension Release {
     for artifact in artifacts {
       try artifact.validate()
     }
+  }
+
+  /// When the feed expires, if it does.
+  public var expiryDate: Date? { expiresAt.flatMap(Self.date) }
+
+  /// Rejects a feed that expired before `now`. Feeds signed before expiry
+  /// existed never expire; rollback protection retires them once a client
+  /// sees a newer build.
+  public func checkFresh(at now: Date = Date()) throws {
+    if let expiry = expiryDate, expiry <= now { throw FeedError.expired }
   }
 
   /// Picks this Mac's artifact if the release is newer than `currentBuild`.
@@ -277,13 +408,13 @@ extension Release {
     notesURL.flatMap(URL.init(string:)) ?? UpdateConfig.releasesURL
   }
 
-  // isValidTimestamp accepts RFC 3339 / ISO 8601 timestamps with or without
-  // fractional seconds.
-  static func isValidTimestamp(_ string: String) -> Bool {
-    if ISO8601DateFormatter().date(from: string) != nil { return true }
+  // date parses RFC 3339 / ISO 8601 timestamps with or without fractional
+  // seconds.
+  static func date(_ string: String) -> Date? {
+    if let date = ISO8601DateFormatter().date(from: string) { return date }
     let fractional = ISO8601DateFormatter()
     fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return fractional.date(from: string) != nil
+    return fractional.date(from: string)
   }
 
   // release versions use the same numeric ordering as minimum OS versions.

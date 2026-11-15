@@ -1,0 +1,120 @@
+name: Refresh feed
+
+# Re-signs the live update.json with a later expiry once it is within
+# Feed.refreshMargin of expiring, so clients keep trusting it between
+# releases. The release itself doesn't change: same build, same artifacts,
+# only expires_at moves. Runs weekly; a run with nothing to do deploys nothing.
+#
+# Secrets are those release.yml signs the feed with: SPARKLE_EDDSA_PRIVATE_KEY,
+# and BABY_FEED_SIGNING_KEY once scripts/rotate-feed-key.sh has run.
+#
+# GitHub turns off scheduled workflows after 60 days without repository
+# activity. A feed is valid for 90 days and refreshed once fewer than 60
+# remain, so it still has at least 60 days left when that happens; rerun this
+# workflow by hand or push to keep the schedule alive.
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+# shares release.yml's group so a refresh never races a release's deploy
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.refresh.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Fetch live feed
+        run: |
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json"
+          curl -fsSL -H 'Cache-Control: no-cache' -o "${RUNNER_TEMP}/live.json" "${url}"
+
+      - name: Build baby-update-tool
+        run: |
+          swift build -c release --product baby-update-tool
+          bin_dir="$(swift build -c release --show-bin-path)"
+          mkdir -p build
+          cp "${bin_dir}/baby-update-tool" build/baby-update-tool
+
+      - name: Refresh the feed
+        id: refresh
+        env:
+          LEGACY_SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+          FEED_SIGNING_KEY: ${{ secrets.BABY_FEED_SIGNING_KEY }}
+        run: |
+          mkdir -p _site
+          build/baby-update-tool refresh-feed "${RUNNER_TEMP}/live.json" \
+            --out _site/update.json \
+            < <(printf '%s\n' "${LEGACY_SIGNING_KEY}" "${FEED_SIGNING_KEY}")
+          build/baby-update-tool verify-feed _site/update.json --after "${RUNNER_TEMP}/live.json"
+          if cmp -s "${RUNNER_TEMP}/live.json" _site/update.json; then
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Upload Pages artifact
+        if: steps.refresh.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+
+  deploy-feed:
+    needs: refresh
+    if: needs.refresh.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: github-pages
+          path: published
+
+      # a release may have gone live since the refresh job read the feed
+      - name: Check live feed succession
+        run: |
+          mkdir feed
+          tar -xf published/artifact.tar -C feed
+          curl -fsSL -H 'Cache-Control: no-cache' -o current.json \
+            "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json"
+          python3 scripts/check-feed-succession.py current.json feed/update.json
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Verify the public feed
+        run: |
+          for attempt in $(seq 12); do
+            if curl -fsSL -H 'Cache-Control: no-cache' \
+              "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json" \
+              -o live.json && cmp -s live.json feed/update.json; then
+              exit 0
+            fi
+            echo "feed not live yet (attempt ${attempt})" >&2
+            sleep 5
+          done
+          echo "::error::the public feed differs from the deployed one"
+          exit 1

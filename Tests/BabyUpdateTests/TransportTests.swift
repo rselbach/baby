@@ -114,8 +114,9 @@ private func sha256(_ data: Data) -> String {
   let dest = root.appending(path: "out.zip")
   try await transport.download(artifact, to: dest)
   #expect(try Data(contentsOf: dest) == payload)
+  // a stalled download fails after a minute; a slow one gets 15 minutes
   #expect(capturedDownloadConfig.withLock { $0?.timeoutIntervalForRequest } == 60)
-  #expect(capturedDownloadConfig.withLock { $0?.timeoutIntervalForResource } == 60)
+  #expect(capturedDownloadConfig.withLock { $0?.timeoutIntervalForResource } == 15 * 60)
 
   let feedPayload = Data("small-feed".utf8)
   let feedToken = "feed-\(UUID().uuidString)"

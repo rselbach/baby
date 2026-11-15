@@ -67,9 +67,32 @@ test("uses the signed DMG URL rather than deriving a filename", async () => {
   assert.equal(warnings.length, 0);
 });
 
-test("uses the same verification key as the app", () => {
+test("uses a verification key the app trusts", () => {
   const feed = readFileSync(new URL("../../Sources/BabyUpdate/Feed.swift", import.meta.url), "utf8");
-  assert.equal(configuredKey, feed.match(/public static let publicKey = "([^"]+)"/)[1]);
+  const legacy = feed.match(/public static let legacyPublicKey = "([^"]+)"/)[1];
+  const trusted = feed.match(/public static let publicKeys = \[([^\]]*)\]/)[1]
+    .split(",").map((item) => item.trim())
+    .map((item) => (item === "legacyPublicKey" ? legacy : JSON.parse(item)));
+  assert.ok(trusted.includes(configuredKey), `${configuredKey} is not in ${trusted}`);
+});
+
+test("accepts a feed whose own key's signature is in signatures", async () => {
+  const other = generateKeyPairSync("ed25519");
+  const feed = envelope(release());
+  const message = Buffer.concat([
+    Buffer.from("baby-update-feed-v1\n"), Buffer.from(feed.payload, "base64"),
+  ]);
+  feed.signatures = [feed.signature];
+  feed.signature = sign(null, message, other.privateKey).toString("base64");
+  const { element, warnings } = await render(feed);
+  assert.equal(element("download").href, prefix + "Installer.dmg");
+  assert.equal(warnings.length, 0);
+
+  // without our key's signature anywhere, the fallback stays
+  feed.signatures = [];
+  const unsigned = await render(feed);
+  assert.equal(unsigned.element("download").href, fallback);
+  assert.equal(unsigned.warnings.length, 1);
 });
 
 test("keeps the fallback for tampering or a missing signature", async () => {

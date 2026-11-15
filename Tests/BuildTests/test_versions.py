@@ -29,6 +29,34 @@ class VersionTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode == 0, want, result.stderr)
 
+    def test_build_numbers_grow_with_the_version(self):
+        script = Path(__file__).resolve().parents[2] / "scripts/build-number.sh"
+        cases = {
+            "1.2.2": "1002002", "0.0.1": "1", "1.10.0": "1010000",
+            "999999.999.999": "999999999999",
+            "01.2.3": None, "1.1000.0": None, "1.2": None, "1.2.3.4": None,
+            "0.0.0": None, "v1.2.3": None, "": None,
+        }
+        for version, want in cases.items():
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    ["/bin/bash", str(script), version],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if want is None:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), want)
+        ordered = ["0.9.999", "1.0.0", "1.0.1", "1.1.0", "1.999.999", "2.0.0"]
+        builds = [
+            int(subprocess.run(["/bin/bash", str(script), v], capture_output=True,
+                               text=True, check=True).stdout)
+            for v in ordered
+        ]
+        self.assertEqual(builds, sorted(builds))
+        self.assertEqual(len(set(builds)), len(builds))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,32 @@ private func exitedPID() throws -> pid_t {
   #expect(try Data(contentsOf: app) == Data("previous version".utf8))
 }
 
+@Test func removesRecoveryCopiesOnceTheInstalledBabyHasLaunched() throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let installed = root.appending(path: "Baby.app")
+  let contents = installed.appending(path: "Contents")
+  try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+  try PropertyListSerialization.data(
+    fromPropertyList: ["CFBundleVersion": "8"], format: .xml, options: 0
+  ).write(to: contents.appending(path: "Info.plist"))
+  let folder = root.appending(path: "\(Installer.stagingPrefix)7-\(try exitedPID())-deadbeef")
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  try Data().write(to: folder.appending(path: "recovery-required"))
+
+  // a different running build means the installed bundle isn't the one that launched
+  Installer.removeLeftovers(in: root, installed: installed, runningBuild: 7)
+  #expect(FileManager.default.fileExists(atPath: folder.path))
+  // a missing installed bundle proves nothing either
+  Installer.removeLeftovers(
+    in: root, installed: root.appending(path: "Missing.app"), runningBuild: 8)
+  #expect(FileManager.default.fileExists(atPath: folder.path))
+
+  Installer.removeLeftovers(in: root, installed: installed, runningBuild: 8)
+  #expect(!FileManager.default.fileExists(atPath: folder.path))
+  #expect(FileManager.default.fileExists(atPath: installed.path))
+}
+
 @Test func unzipsDittoArchives() async throws {
   let root = try temporaryFolder()
   defer { Installer.remove(root) }

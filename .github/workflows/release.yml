@@ -15,7 +15,16 @@ name: Release
 #   APPLE_TEAM_ID                 Developer team ID
 #   APPLE_APP_SPECIFIC_PASSWORD   app-specific password of that account
 #   SPARKLE_EDDSA_PRIVATE_KEY     base64 Ed25519 seed whose public key is
-#                                 UpdateConfig.publicKey; signs update.json
+#                                 UpdateConfig.legacyPublicKey; signs the
+#                                 feed's `signature` for builds that predate
+#                                 a dedicated key
+#   BABY_FEED_SIGNING_KEY         base64 Ed25519 seed of the dedicated feed
+#                                 key in UpdateConfig.publicKeys; needed once
+#                                 scripts/rotate-feed-key.sh has run
+#
+# The build number comes from the tag (scripts/build-number.sh), so reruns
+# and re-pushed tags get the same one and every release gets a larger one.
+# refresh-feed.yml re-signs the live feed before it expires.
 #
 # GitHub Pages must use "GitHub Actions" as its source.
 
@@ -48,8 +57,15 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           SPARKLE_EDDSA_PRIVATE_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+          BABY_FEED_SIGNING_KEY: ${{ secrets.BABY_FEED_SIGNING_KEY }}
         run: |
           missing=0
+          # after a key rotation the app trusts a dedicated key, which must sign too
+          if ! grep -q 'public static let publicKeys = \[legacyPublicKey\]' \
+            Sources/BabyUpdate/Feed.swift && [[ -z "${BABY_FEED_SIGNING_KEY}" ]]; then
+            echo "::error::secret BABY_FEED_SIGNING_KEY is not set" >&2
+            missing=1
+          fi
           for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
             APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD \
             SPARKLE_EDDSA_PRIVATE_KEY; do
@@ -60,7 +76,7 @@ jobs:
           done
           exit "${missing}"
 
-      - name: Set version
+      - name: Set version and build
         id: version
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -68,7 +84,12 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} is not a stable vX.Y.Z version" >&2
             exit 1
           fi
+          if ! build="$(scripts/build-number.sh "${version}")"; then
+            echo "::error::tag ${GITHUB_REF_NAME} has no build number" >&2
+            exit 1
+          fi
           echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          echo "build=${build}" >>"${GITHUB_OUTPUT}"
 
       - name: Test
         run: swift test
@@ -110,7 +131,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
-          BUILD: ${{ github.run_number }}
+          BUILD: ${{ steps.version.outputs.build }}
         run: |
           swift build -c release --product baby-update-tool
           bin_dir="$(swift build -c release --show-bin-path)"
@@ -185,7 +206,7 @@ jobs:
         if: steps.existing.outputs.complete != 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          BUILD: ${{ github.run_number }}
+          BUILD: ${{ steps.version.outputs.build }}
           DMGBUILD: ${{ steps.dmgbuild.outputs.bin }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -206,8 +227,9 @@ jobs:
       - name: Sign the update feed
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          BUILD: ${{ github.run_number }}
-          SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+          BUILD: ${{ steps.version.outputs.build }}
+          LEGACY_SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+          FEED_SIGNING_KEY: ${{ secrets.BABY_FEED_SIGNING_KEY }}
           LIVE_FEED: ${{ steps.live.outputs.path }}
         run: |
           zip="Baby-${VERSION}-macos-arm64.zip"
@@ -227,7 +249,8 @@ jobs:
             --zip "build/${zip}" --zip-url "${base}/${zip}" \
             --dmg "build/${dmg}" --dmg-url "${base}/${dmg}" \
             ${after_args[@]+"${after_args[@]}"} \
-            --out _site/update.json <<<"${SIGNING_KEY}"
+            --out _site/update.json \
+            < <(printf '%s\n' "${LEGACY_SIGNING_KEY}" "${FEED_SIGNING_KEY}")
           if [[ -n "${LIVE_FEED}" ]]; then
             build/baby-update-tool verify-feed _site/update.json --after "${LIVE_FEED}"
           fi
@@ -249,7 +272,7 @@ jobs:
       - name: Verify published artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          BUILD: ${{ github.run_number }}
+          BUILD: ${{ steps.version.outputs.build }}
           LIVE_FEED: ${{ steps.live.outputs.path }}
         run: |
           after_args=()
@@ -292,6 +315,9 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: github-pages
@@ -300,8 +326,8 @@ jobs:
       # refuse to overwrite a newer live feed when an older run is redeployed
       - name: Check live feed monotonicity
         run: |
-          mkdir site
-          tar -xf published/artifact.tar -C site
+          mkdir feed
+          tar -xf published/artifact.tar -C feed
           url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json"
           code="$(curl -sSL -H 'Cache-Control: no-cache' -o current.json \
             -w '%{http_code}' "${url}")"
@@ -313,26 +339,7 @@ jobs:
               exit 1
               ;;
           esac
-          python3 - current.json site/update.json <<'PY'
-          import base64, json, sys
-
-          def load(path):
-            raw = open(path, "rb").read()
-            env = json.loads(raw)
-            rel = json.loads(base64.b64decode(env["payload"]))
-            parts = [int(p) for p in rel["version"].split(".")]
-            ver = tuple(parts + [0] * (3 - len(parts)))
-            return raw, rel, ver
-
-          cur_raw, cur, cur_ver = load(sys.argv[1])
-          new_raw, new, new_ver = load(sys.argv[2])
-          if new_raw == cur_raw or new == cur:
-            sys.exit(0)
-          if new["build"] <= cur["build"]:
-            sys.exit(f"refusing build {new['build']} <= live build {cur['build']}")
-          if new_ver < cur_ver:
-            sys.exit(f"refusing version {new['version']} < live version {cur['version']}")
-          PY
+          python3 scripts/check-feed-succession.py current.json feed/update.json
 
       - name: Deploy to GitHub Pages
         id: deployment
@@ -343,7 +350,7 @@ jobs:
           for attempt in $(seq 12); do
             if curl -fsSL -H 'Cache-Control: no-cache' \
               "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/update.json" \
-              -o live.json && cmp -s live.json site/update.json; then
+              -o live.json && cmp -s live.json feed/update.json; then
               exit 0
             fi
             echo "feed not live yet (attempt ${attempt})" >&2

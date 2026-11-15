@@ -88,7 +88,7 @@ private func encode(_ envelope: [String: String]) throws -> Data {
 
 @Test(arguments: [
   "app", "channel", "version", "build", "published_at", "notes_url", "artifacts", "sha256",
-  "size", "minimum_os",
+  "size", "minimum_os", "expires_at",
 ])
 func rejectsInvalidFields(field: String) throws {
   var bad = release()
@@ -103,6 +103,7 @@ func rejectsInvalidFields(field: String) throws {
   case "sha256": bad.artifacts[0].sha256 = "AB"
   case "size": bad.artifacts[0].size = 0
   case "minimum_os": bad.artifacts[0].minimumOS = "14.0.0.1"
+  case "expires_at": bad.expiresAt = "2026-11-03T11:59:59Z"
   default: Issue.record("unknown field \(field)")
   }
   let feed = try Feed.seal(bad, privateKey: key)
@@ -168,8 +169,11 @@ func rejectsUnsafeArtifactURLs(url: String) throws {
   #expect(!Transport.isAllowed(URL(string: "https://user:pw@github.com/x")!))
 }
 
-@Test func publicKeyParses() throws {
-  #expect(try Feed.publicKey().rawRepresentation.count == 32)
+@Test func publicKeysParse() throws {
+  #expect(try Feed.legacyPublicKey().rawRepresentation.count == 32)
+  let keys = try Feed.publicKeys()
+  #expect(!keys.isEmpty)
+  #expect(keys.allSatisfy { $0.rawRepresentation.count == 32 })
 }
 
 @Test(arguments: ["1.2.0-beta", "1.2.0+build", "1.2.3.4", "9223372036854775808", "1..2"])
@@ -215,4 +219,94 @@ func rejectsReleaseVersionsThatCannotBeOrdered(version: String) throws {
     version: "1.2.1", build: 8, notesURL: base.notesURL, artifacts: base.artifacts,
     privateKey: key, after: liveFeed, publicKey: key.publicKey)
   try nextRelease.verifySupersedes(liveRelease)
+}
+
+private let launch = Date(timeIntervalSince1970: 1_800_000_000)
+
+@Test func publishedFeedsExpire() throws {
+  let base = release()
+  let (feed, published) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKey: key, publicKey: key.publicKey, now: launch)
+  let opened = try Feed.open(feed, publicKey: key.publicKey)
+  #expect(opened == published)
+  #expect(opened.expiryDate == launch.addingTimeInterval(Feed.validity))
+  try opened.checkFresh(at: launch.addingTimeInterval(Feed.validity - 1))
+  #expect(throws: FeedError.expired) {
+    try opened.checkFresh(at: launch.addingTimeInterval(Feed.validity))
+  }
+  // feeds signed before expiry existed stay readable
+  try release().checkFresh(at: .distantFuture)
+}
+
+@Test func refreshReSignsOnlyFeedsCloseToExpiring() throws {
+  let legacy = try Feed.seal(release(), privateKey: key)
+  let (refreshed, renewed) = try Feed.refresh(
+    legacy, privateKeys: [key], publicKeys: [key.publicKey], now: launch)
+  #expect(refreshed != legacy)
+  #expect(renewed.expiryDate == launch.addingTimeInterval(Feed.validity))
+  try renewed.verifySupersedes(release())
+
+  // a feed with plenty of time left is reused byte for byte
+  let soon = launch.addingTimeInterval(Feed.validity - Feed.refreshMargin - 60)
+  let (again, _) = try Feed.refresh(
+    refreshed, privateKeys: [key], publicKeys: [key.publicKey], now: soon)
+  #expect(again == refreshed)
+
+  let late = launch.addingTimeInterval(Feed.validity - Feed.refreshMargin + 60)
+  let (later, laterRelease) = try Feed.refresh(
+    refreshed, privateKeys: [key], publicKeys: [key.publicKey], now: late)
+  #expect(later != refreshed)
+  #expect(laterRelease.expiryDate == late.addingTimeInterval(Feed.validity))
+  try laterRelease.verifySupersedes(renewed)
+}
+
+@Test func refreshesCannotShortenOrDropExpiry() throws {
+  var current = release()
+  current.expiresAt = "2027-01-01T00:00:00Z"
+  var earlier = current
+  earlier.expiresAt = "2026-12-01T00:00:00Z"
+  #expect(throws: FeedError.rollback(seen: 7, got: 7)) { try earlier.verifySupersedes(current) }
+  var dropped = current
+  dropped.expiresAt = nil
+  #expect(throws: FeedError.rollback(seen: 7, got: 7)) { try dropped.verifySupersedes(current) }
+  var changed = current
+  changed.expiresAt = "2027-02-01T00:00:00Z"
+  changed.notesURL = nil
+  #expect(throws: FeedError.rollback(seen: 7, got: 7)) { try changed.verifySupersedes(current) }
+}
+
+@Test func feedsSignedWithSeveralKeysVerifyWithAnyOfThem() throws {
+  let dedicated = Curve25519.Signing.PrivateKey()
+  let feed = try Feed.seal(release(), privateKeys: [key, dedicated])
+  #expect(try Feed.open(feed, publicKey: key.publicKey) == release())
+  #expect(try Feed.open(feed, publicKey: dedicated.publicKey) == release())
+  #expect(throws: FeedError.badSignature) {
+    try Feed.open(feed, publicKey: Curve25519.Signing.PrivateKey().publicKey)
+  }
+
+  // older builds read only `signature`, which the first key signs
+  let fields = try JSONSerialization.jsonObject(with: feed) as? [String: Any]
+  let payload = try #require(Data(base64Encoded: try #require(fields?["payload"] as? String)))
+  let signature = try #require(
+    Data(base64Encoded: try #require(fields?["signature"] as? String)))
+  #expect(key.publicKey.isValidSignature(signature, for: Feed.signingContext + payload))
+  #expect((fields?["signatures"] as? [String])?.count == 1)
+}
+
+@Test func publishRequiresEveryTrustedSigner() throws {
+  let base = release()
+  let dedicated = Curve25519.Signing.PrivateKey()
+  #expect(throws: FeedError.badSignature) {
+    _ = try Feed.publish(
+      version: base.version, build: base.build, notesURL: base.notesURL,
+      artifacts: base.artifacts, privateKeys: [key],
+      publicKeys: [key.publicKey, dedicated.publicKey])
+  }
+  let (feed, _) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKeys: [key, dedicated],
+    publicKeys: [dedicated.publicKey])
+  _ = try Feed.open(feed, publicKey: key.publicKey)
+  _ = try Feed.open(feed, publicKey: dedicated.publicKey)
 }

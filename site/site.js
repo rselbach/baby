@@ -22,16 +22,23 @@
     if (!response.ok) throw new Error(`feed returned ${response.status}`);
     const body = await response.arrayBuffer();
     if (body.byteLength > 64 * 1024) throw new Error("feed is too large");
-    const { payload, signature } = JSON.parse(new TextDecoder().decode(body));
+    const { payload, signature, signatures = [] } = JSON.parse(new TextDecoder().decode(body));
     const bytes = decodeBase64(payload);
     const context = new TextEncoder().encode("baby-update-feed-v1\n");
     const message = new Uint8Array(context.length + bytes.length);
     message.set(context);
     message.set(bytes, context.length);
     const key = await crypto.subtle.importKey("raw", decodeBase64(PUBLIC_KEY), "Ed25519", false, ["verify"]);
-    if (!await crypto.subtle.verify("Ed25519", key, decodeBase64(signature), message)) {
-      throw new Error("feed signature is invalid");
+    // `signature` is by the legacy key; a dedicated key's is in `signatures`
+    if (!Array.isArray(signatures)) throw new Error("feed signatures are malformed");
+    let verified = false;
+    for (const candidate of [signature, ...signatures]) {
+      if (await crypto.subtle.verify("Ed25519", key, decodeBase64(candidate), message)) {
+        verified = true;
+        break;
+      }
     }
+    if (!verified) throw new Error("feed signature is invalid");
     const release = JSON.parse(new TextDecoder().decode(bytes));
     if (release.schema !== 1 || release.app !== "com.rselbach.baby" || release.channel !== "stable" ||
         typeof release.version !== "string" || !/^\d+(\.\d+){0,2}$/.test(release.version) ||

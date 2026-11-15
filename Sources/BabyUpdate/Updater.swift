@@ -29,7 +29,7 @@ public final class Updater {
   }
 
   // a staged update: the verified Baby.app inside its staging folder
-  private struct Staged {
+  private struct Staged: Sendable {
     let release: Release
     let folder: URL
     let app: URL
@@ -38,6 +38,7 @@ public final class Updater {
   private static let launchDelay: Duration = .seconds(10)
   private static let pollInterval: TimeInterval = 60 * 60
   private static let checkInterval: TimeInterval = 24 * 60 * 60
+  private static let restartStagingLimit: Duration = .seconds(60)
 
   public private(set) var state: State = .idle
   /// Whether Baby checks for updates on launch and daily.
@@ -57,6 +58,7 @@ public final class Updater {
   private let publicKey: Curve25519.Signing.PublicKey?
   private let codeRequirement: String
   private let relaunch: @Sendable ([String]) throws -> Void
+  private let now: @Sendable () -> Date
   private var staged: Staged?
   private var timer: Timer?
   private var installationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -90,7 +92,8 @@ public final class Updater {
     codeRequirement: String = UpdateConfig.codeRequirement,
     relaunch: @escaping @Sendable ([String]) throws -> Void = {
       try Installer.runAfterExit(of: getpid(), $0)
-    }
+    },
+    now: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.version = version
     self.build = build
@@ -102,13 +105,18 @@ public final class Updater {
     self.publicKey = publicKey
     self.codeRequirement = codeRequirement
     self.relaunch = relaunch
+    self.now = now
     self.automaticChecks = defaults.object(forKey: Key.automaticChecks) as? Bool ?? true
   }
 
   /// Removes leftovers from earlier updates and starts scheduled checks.
   public func start() {
     let parent = bundleURL.deletingLastPathComponent()
-    Task.detached { Installer.removeLeftovers(in: parent) }
+    let installed = bundleURL
+    let build = self.build
+    Task.detached {
+      Installer.removeLeftovers(in: parent, installed: installed, runningBuild: build)
+    }
     Task {
       try? await Task.sleep(for: Self.launchDelay)
       await checkIfDue()
@@ -169,9 +177,11 @@ public final class Updater {
         currentBuild: build, os: os, arch: arch),
       let parent = replaceableParent()
     {
+      // the user is waiting on the restart, so don't give a slow download
+      // the full download time limit
       if let replacement = try? await Self.stage(
         newerRelease, artifact, in: parent, transport: transport, os: os,
-        requirement: codeRequirement)
+        requirement: codeRequirement, timeLimit: Self.restartStagingLimit)
       {
         discardStaged()
         staged = replacement
@@ -247,11 +257,13 @@ public final class Updater {
     await check()
   }
 
-  // fetchRelease verifies the feed and refuses one older than any already
-  // verified, so a replayed old feed cannot roll Baby back.
+  // fetchRelease verifies the feed and refuses one that has expired or is
+  // older than any already verified, so a replayed old feed can neither roll
+  // Baby back nor hide newer releases for long.
   private func fetchRelease(timeout: TimeInterval = 60) async throws -> Release {
     let release = try Feed.open(
       try await transport.fetchFeed(timeout: timeout), publicKey: publicKey)
+    try release.checkFresh(at: now())
     let seen = defaults.integer(forKey: Key.highestBuildSeen)
     guard release.build >= seen else {
       throw FeedError.rollback(seen: seen, got: release.build)
@@ -298,6 +310,28 @@ public final class Updater {
     } catch {
       Installer.remove(folder)
       throw error
+    }
+  }
+
+  // stage with timeLimit gives up, and cleans up, once the limit passes.
+  @concurrent
+  private static func stage(
+    _ release: Release, _ artifact: Artifact, in parent: URL, transport: Transport,
+    os: OSVersion, requirement: String, timeLimit: Duration
+  ) async throws -> Staged {
+    try await withThrowingTaskGroup(of: Staged.self) { group in
+      group.addTask {
+        try await Self.stage(
+          release, artifact, in: parent, transport: transport, os: os,
+          requirement: requirement)
+      }
+      group.addTask {
+        try await Task.sleep(for: timeLimit)
+        throw CancellationError()
+      }
+      defer { group.cancelAll() }
+      guard let staged = try await group.next() else { throw CancellationError() }
+      return staged
     }
   }
 

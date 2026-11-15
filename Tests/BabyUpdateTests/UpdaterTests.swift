@@ -389,6 +389,42 @@ func preservesStagedUpdateWhenNewerReleaseCannotBeInstalled(launchArguments: [St
   ])
   #expect(status != 0)
   #expect(errText.contains("unknown option --verison"))
+
+  // generate-key writes a seed only its owner can read, and never over a file
+  let root = FileManager.default.temporaryDirectory.appending(path: "tool-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let seedFile = root.appending(path: "seed.txt")
+  #expect(try runTool(["generate-key", "--seed-out", seedFile.path]).0 == 0)
+  let seed = try String(contentsOf: seedFile, encoding: .utf8)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  #expect(Data(base64Encoded: seed)?.count == 32)
+  let mode = try FileManager.default.attributesOfItem(atPath: seedFile.path)[.posixPermissions]
+  #expect(mode as? Int == 0o600)
+  #expect(try runTool(["generate-key", "--seed-out", seedFile.path]).0 != 0)
+  #expect(try String(contentsOf: seedFile, encoding: .utf8).hasPrefix(seed))
+
+  // signing refuses a key Baby doesn't trust before touching the feed
+  let refresh = Process()
+  refresh.executableURL = tool
+  refresh.arguments = [
+    "refresh-feed", root.appending(path: "live.json").path,
+    "--out", root.appending(path: "out.json").path,
+  ]
+  let input = Pipe()
+  let errors = Pipe()
+  refresh.standardInput = input
+  refresh.standardError = errors
+  refresh.standardOutput = FileHandle.nullDevice
+  try refresh.run()
+  try input.fileHandleForWriting.write(contentsOf: Data((seed + "\n").utf8))
+  try input.fileHandleForWriting.close()
+  refresh.waitUntilExit()
+  #expect(refresh.terminationStatus != 0)
+  let refusal = String(
+    decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+  #expect(refusal.contains("is not one Baby trusts"))
+  #expect(!FileManager.default.fileExists(atPath: root.appending(path: "out.json").path))
 }
 
 @MainActor
@@ -465,4 +501,33 @@ func waitsForAnInstallationBeforeQuitting(restart: Bool) async throws {
   #expect(installedBuild(at: recovery.appending(path: "Baby.app")) == "1")
   #expect(
     FileManager.default.fileExists(atPath: recovery.appending(path: "recovery-required").path))
+}
+
+@MainActor
+@Test func refusesExpiredFeeds() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let app = root.appending(path: "Baby.app")
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  var release = try packageRelease(in: root, version: "1.1.0", build: 2).release
+  release.expiresAt = "2026-12-01T00:00:00Z"
+  let feed = try Feed.seal(release, privateKey: signingKey)
+  let token = "updater-expired-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { _ in .init(body: feed) }
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, relaunch: { _ in },
+    now: { Date(timeIntervalSince1970: 1_800_000_000) })
+
+  // 15 January 2027 is after the feed expired
+  await updater.check()
+  #expect(updater.state == .failed(FeedError.expired.localizedDescription))
+  // an expired feed doesn't count as seen, so it can't block a fresh one
+  #expect(defaults.integer(forKey: "highestUpdateBuildSeen") == 0)
 }

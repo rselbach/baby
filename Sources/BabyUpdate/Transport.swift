@@ -25,6 +25,11 @@ public enum TransportError: LocalizedError, Equatable {
 public struct Transport: Sendable {
   /// The User-Agent sent with every request.
   public let userAgent: String
+  /// How long a download may go without receiving data before it fails.
+  public static let downloadIdleTimeout: TimeInterval = 60
+  /// How long a whole download may take, so a slow connection can still
+  /// finish one while a stalled one fails at the idle timeout.
+  public static let downloadTotalTimeout: TimeInterval = 15 * 60
   private let makeConfiguration: @Sendable () -> URLSessionConfiguration
 
   public init(userAgent: String) {
@@ -54,7 +59,10 @@ public struct Transport: Sendable {
   @concurrent
   public func fetchFeed(timeout: TimeInterval = 60) async throws -> Data {
     var data = Data()
-    try await stream(UpdateConfig.feedURL, timeout: timeout, limit: Int64(Feed.maxBytes)) {
+    try await stream(
+      UpdateConfig.feedURL, idleTimeout: timeout, totalTimeout: timeout,
+      limit: Int64(Feed.maxBytes)
+    ) {
       data.append($0)
     }
     return data
@@ -75,7 +83,10 @@ public struct Transport: Sendable {
       defer { try? handle.close() }
       var hasher = SHA256()
       var written: Int64 = 0
-      try await stream(url, timeout: 60, limit: artifact.size) { chunk in
+      try await stream(
+        url, idleTimeout: Self.downloadIdleTimeout, totalTimeout: Self.downloadTotalTimeout,
+        limit: artifact.size
+      ) { chunk in
         hasher.update(data: chunk)
         try handle.write(contentsOf: chunk)
         written += Int64(chunk.count)
@@ -90,18 +101,19 @@ public struct Transport: Sendable {
   }
 
   // stream GETs url and hands its body to consume in chunks, failing once
-  // more than limit bytes arrive.
+  // more than limit bytes arrive, no data arrives for idleTimeout, or the
+  // whole transfer takes longer than totalTimeout.
   private func stream(
-    _ url: URL, timeout: TimeInterval, limit: Int64,
+    _ url: URL, idleTimeout: TimeInterval, totalTimeout: TimeInterval, limit: Int64,
     consume: (Data) throws -> Void
   ) async throws {
     guard Self.isAllowed(url) else { throw TransportError.disallowedURL(url.absoluteString) }
     var request = URLRequest(
-      url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+      url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: idleTimeout)
     request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
     let configuration = makeConfiguration()
-    configuration.timeoutIntervalForRequest = timeout
-    configuration.timeoutIntervalForResource = timeout
+    configuration.timeoutIntervalForRequest = idleTimeout
+    configuration.timeoutIntervalForResource = totalTimeout
     let session = URLSession(
       configuration: configuration, delegate: RedirectPolicy(), delegateQueue: nil)
     defer { session.invalidateAndCancel() }

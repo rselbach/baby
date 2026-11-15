@@ -99,16 +99,32 @@ public enum Installer {
 
   /// Deletes staging folders in `parent` whose owning process is gone; they
   /// hold a finished update's old bundle or an abandoned download.
-  public static func removeLeftovers(in parent: URL) {
+  ///
+  /// A folder marked for recovery holds the only other copy of Baby from an
+  /// interrupted swap. It is deleted only once the bundle at `installed`
+  /// carries `runningBuild`: that proves the installed Baby is the one that
+  /// launched, so it works and the other copy is no longer needed. Without
+  /// both, recovery copies are always kept.
+  public static func removeLeftovers(
+    in parent: URL, installed: URL? = nil, runningBuild: Int? = nil
+  ) {
     let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+    var installedLaunched: Bool {
+      guard let installed, let runningBuild else { return false }
+      let plist = installed.appending(components: "Contents", "Info.plist")
+      let build = NSDictionary(contentsOf: plist)?["CFBundleVersion"] as? String
+      return build == String(runningBuild)
+    }
     for name in names where name.hasPrefix(stagingPrefix) {
       let folder = parent.appending(path: name)
-      if FileManager.default.fileExists(atPath: folder.appending(path: recoveryMarker).path) {
-        continue
-      }
       let fields = name.dropFirst(stagingPrefix.count).split(separator: "-")
       guard fields.count == 3, let pid = pid_t(fields[1]), pid != getpid() else { continue }
       if kill(pid, 0) == 0 || errno == EPERM { continue }
+      if FileManager.default.fileExists(atPath: folder.appending(path: recoveryMarker).path),
+        !installedLaunched
+      {
+        continue
+      }
       remove(folder)
     }
   }
