@@ -67,6 +67,22 @@ test("uses the signed DMG URL rather than deriving a filename", async () => {
   assert.equal(warnings.length, 0);
 });
 
+test("strips all trailing .0 components from minimum_os", async () => {
+  for (const [minimumOS, expected] of [
+    ["14", "14"],
+    ["14.0", "14"],
+    ["14.0.0", "14"],
+    ["14.2.0", "14.2"],
+    ["14.0.1", "14.0.1"],
+  ]) {
+    const value = release();
+    value.artifacts[1].minimum_os = minimumOS;
+    const { element, warnings } = await render(envelope(value));
+    assert.equal(element("download-meta").children[1], ` · Apple silicon, macOS ${expected} or later`);
+    assert.equal(warnings.length, 0);
+  }
+});
+
 test("uses a verification key the app trusts", () => {
   const feed = readFileSync(new URL("../../Sources/BabyUpdate/Feed.swift", import.meta.url), "utf8");
   const legacy = feed.match(/public static let legacyPublicKey = "([^"]+)"/)[1];
