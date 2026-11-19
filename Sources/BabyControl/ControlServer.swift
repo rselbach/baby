@@ -14,11 +14,13 @@ public final class ControlServer: Sendable {
 
   /// Starts listening at `url`, replacing any socket an earlier Baby left
   /// there. `handler` runs on the main actor once per request. Connections
-  /// beyond `maximumConnections` at once are answered that Baby is busy.
+  /// beyond `maximumConnections` at once are answered that Baby is busy;
+  /// `maximumConnections` must be at least 1.
   public init(
     url: URL, maximumConnections: Int = defaultMaximumConnections,
     handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
   ) throws {
+    precondition(maximumConnections >= 1, "maximumConnections must be at least 1")
     let path = url.path
     let directory = url.deletingLastPathComponent().path
     try FileManager.default.createDirectory(
@@ -26,26 +28,15 @@ public final class ControlServer: Sendable {
     guard chmod(directory, 0o700) == 0 else { throw ControlError.system("chmod", errno) }
     let lock = open(path + ".lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o600)
     guard lock >= 0 else { throw ControlError.system("open", errno) }
+    var started = false
+    defer { if !started { close(lock) } }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
-      let failure = errno
-      close(lock)
-      if failure == EWOULDBLOCK { throw ControlError.alreadyRunning }
-      throw ControlError.system("flock", failure)
+      if errno == EWOULDBLOCK { throw ControlError.alreadyRunning }
+      throw ControlError.system("flock", errno)
     }
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else {
-      let failure = errno
-      close(lock)
-      throw ControlError.system("socket", failure)
-    }
-    let inode: ino_t
-    do {
-      inode = try Self.listen(fd, at: path)
-    } catch {
-      close(fd)
-      close(lock)
-      throw error
-    }
+    let fd = try makeSocket()
+    defer { if !started { close(fd) } }
+    let inode = try Self.listen(fd, at: path)
     source = DispatchSource.makeReadSource(
       fileDescriptor: fd, queue: DispatchQueue(label: "com.rselbach.baby.control"))
     let slots = DispatchSemaphore(value: maximumConnections)
@@ -59,8 +50,11 @@ public final class ControlServer: Sendable {
       close(lock)
       stopped.leave()
     }
+    started = true
     source.resume()
   }
+
+  var fileDescriptor: Int32 { Int32(source.handle) }
 
   deinit {
     stop()
@@ -81,8 +75,7 @@ public final class ControlServer: Sendable {
         guard existing.st_mode & S_IFMT == S_IFSOCK else {
           throw ControlError.system("bind", EEXIST)
         }
-        let probe = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard probe >= 0 else { throw ControlError.system("socket", errno) }
+        let probe = try makeSocket()
         defer { close(probe) }
         guard fcntl(probe, F_SETFL, O_NONBLOCK) == 0 else {
           throw ControlError.system("fcntl", errno)
@@ -117,12 +110,22 @@ public final class ControlServer: Sendable {
     return info.st_ino
   }
 
+  // acceptClient accepts one pending connection with FD_CLOEXEC set.
+  static func acceptClient(on fd: Int32) -> Int32? {
+    let client = Darwin.accept(fd, nil, nil)
+    guard client >= 0 else { return nil }
+    guard (try? setCloseOnExec(client)) != nil else {
+      close(client)
+      return nil
+    }
+    return client
+  }
+
   private static func accept(
     on fd: Int32, slots: DispatchSemaphore,
     handler: @escaping @MainActor @Sendable (ControlRequest) -> ControlResponse
   ) {
-    let client = Darwin.accept(fd, nil, nil)
-    guard client >= 0 else { return }
+    guard let client = acceptClient(on: fd) else { return }
     guard slots.wait(timeout: .now()) == .success else {
       refuse(client)
       return
