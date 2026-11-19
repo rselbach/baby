@@ -504,6 +504,71 @@ func waitsForAnInstallationBeforeQuitting(restart: Bool) async throws {
 }
 
 @MainActor
+@Test(arguments: [false, true])
+func keepsRecoveryMarkerUntilUpdatedBuildLaunches(restart: Bool) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let app = root.appending(path: "Baby.app", directoryHint: .isDirectory)
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  let next = try packageRelease(in: root, version: "1.1.0", build: 2)
+  let token = "updater-recovery-keep-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { request in
+    request.url == UpdateConfig.feedURL ? .init(body: next.feed) : .init(body: next.zip)
+  }
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, relaunch: { _ in })
+
+  await updater.check()
+  try #require(updater.state == .ready(version: "1.1.0"))
+  if restart {
+    #expect(await updater.restartToUpdate(launchArguments: { ["--asleep"] }))
+  } else {
+    await updater.installBeforeQuit()
+  }
+  #expect(updater.state == .installed)
+  #expect(installedBuild(at: app) == "2")
+
+  let folders = try FileManager.default.contentsOfDirectory(
+    at: root, includingPropertiesForKeys: nil)
+  let staging = try #require(
+    folders.first { $0.lastPathComponent.hasPrefix(Installer.stagingPrefix) })
+  #expect(installedBuild(at: staging.appending(path: "Baby.app")) == "1")
+  #expect(
+    FileManager.default.fileExists(
+      atPath: staging.appending(path: Installer.recoveryMarker).path))
+
+  // simulate the old process having exited so removeLeftovers evaluates the staging folder
+  let exited = Process()
+  exited.executableURL = URL(filePath: "/usr/bin/true")
+  try exited.run()
+  exited.waitUntilExit()
+  let fields = staging.lastPathComponent.dropFirst(Installer.stagingPrefix.count).split(
+    separator: "-")
+  try #require(fields.count == 3)
+  let retired = root.appending(
+    path: "\(Installer.stagingPrefix)\(fields[0])-\(exited.processIdentifier)-\(fields[2])")
+  try FileManager.default.moveItem(at: staging, to: retired)
+
+  // without the new build running, the recovery marker keeps the previous bundle safe
+  Installer.removeLeftovers(in: root)
+  #expect(FileManager.default.fileExists(atPath: retired.path))
+  Installer.removeLeftovers(in: root, installed: app, runningBuild: 1)
+  #expect(FileManager.default.fileExists(atPath: retired.path))
+
+  // once the updated build launches, removeLeftovers cleans up the staging folder
+  Installer.removeLeftovers(in: root, installed: app, runningBuild: 2)
+  #expect(!FileManager.default.fileExists(atPath: retired.path))
+  #expect(installedBuild(at: app) == "2")
+}
+
+@MainActor
 @Test func refusesExpiredFeeds() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
   try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
