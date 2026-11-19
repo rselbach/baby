@@ -85,7 +85,7 @@
 
     document.getElementById("download").href = dmg.url;
 
-    const major = dmg.minimum_os.replace(/\.0$/, "");
+    const major = dmg.minimum_os.replace(/(\.0)+$/, "");
     const version = `Version ${release.version}`;
     const notes = safeURL(release.notes_url, "https://github.com/rselbach/baby/")
       ? link(version, release.notes_url)
