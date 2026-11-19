@@ -35,6 +35,24 @@ func send(
   return response
 }
 
+func holdRequest(_ options: HoldOptions, pid: Int32?, label: String?) -> ControlRequest {
+  ControlRequest(
+    command: .hold, id: options.id, label: options.label ?? label, seconds: options.seconds,
+    pid: pid)
+}
+
+// hold asks Baby to hold a lease and returns it, failing if Baby omits the
+// lease from its reply.
+func hold(
+  _ options: HoldOptions, pid: Int32? = nil, label: String? = nil,
+  via connection: BabyConnection = BabyConnection()
+) throws -> Lease {
+  let response = try send(
+    holdRequest(options, pid: pid ?? options.pid, label: label), launch: true, via: connection)
+  guard let lease = response.lease else { throw ControlError.badMessage }
+  return lease
+}
+
 func waitForBaby(_ request: ControlRequest, via connection: BabyConnection) throws
   -> ControlResponse
 {

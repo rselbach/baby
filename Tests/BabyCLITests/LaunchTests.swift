@@ -82,6 +82,31 @@ private let status = ControlRequest(command: .status)
   #expect(script.opened == 0)
 }
 
+@Test func holdReturnsLeaseFromReply() throws {
+  let lease = Lease(id: "claude", label: "Claude Code")
+  let script = Script([.success(ControlResponse(lease: lease))])
+  let options = HoldOptions(seconds: 1800, pid: 4821, id: "claude", label: "Claude Code")
+  #expect(try hold(options, via: script.connection) == lease)
+  #expect(
+    script.sent == [
+      ControlRequest(command: .hold, id: "claude", label: "Claude Code", seconds: 1800, pid: 4821)
+    ])
+}
+
+@Test func holdFailsWhenReplyOmitsLease() {
+  let script = Script([.success(ControlResponse())])
+  #expect(throws: ControlError.badMessage) {
+    try hold(HoldOptions(), via: script.connection)
+  }
+}
+
+@Test func holdReportsErrorsBabySends() {
+  let script = Script([.success(ControlResponse(error: "Process 99 is not running."))])
+  #expect(throws: CLIError(message: "Process 99 is not running.")) {
+    try hold(HoldOptions(pid: 99), via: script.connection)
+  }
+}
+
 @Test func opensTheAppTheToolShipsIn() {
   let app = containingApp(of: "/Applications/Baby.app/Contents/Helpers/baby")
   #expect(app?.path == "/Applications/Baby.app")
