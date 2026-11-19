@@ -20,18 +20,12 @@ func processName(_ pid: Int32) -> String? {
   return URL(filePath: path).lastPathComponent
 }
 
-func holdRequest(_ options: HoldOptions, pid: Int32?, label: String?) -> ControlRequest {
-  ControlRequest(
-    command: .hold, id: options.id, label: options.label ?? label, seconds: options.seconds,
-    pid: pid)
-}
-
 // run holds a lease on this process and then becomes command, so the lease
 // ends exactly when command exits.
 func run(_ options: HoldOptions, command: [String]) -> Never {
   let label = URL(filePath: command[0]).lastPathComponent
   do {
-    _ = try send(holdRequest(options, pid: getpid(), label: label), launch: true)
+    _ = try hold(options, pid: getpid(), label: label)
   } catch {
     FileHandle.standardError.write(
       Data("baby: warning: not keeping the Mac awake: \(error.localizedDescription)\n".utf8))
@@ -110,8 +104,8 @@ func main() {
       run(options, command: command)
     case .hold(let options):
       let label = options.pid.flatMap(processName)
-      let response = try send(holdRequest(options, pid: options.pid, label: label), launch: true)
-      print(response.lease?.id ?? "")
+      let lease = try hold(options, pid: options.pid, label: label)
+      print(lease.id)
     case .release(let id):
       do {
         _ = try send(ControlRequest(command: .release, id: id), launch: false)
