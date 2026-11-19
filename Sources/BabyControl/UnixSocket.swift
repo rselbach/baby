@@ -48,6 +48,27 @@ func withAddress<T>(
   }
 }
 
+// setCloseOnExec keeps a file descriptor from leaking into child processes.
+func setCloseOnExec(_ fd: Int32) throws {
+  let flags = fcntl(fd, F_GETFD)
+  guard flags >= 0, fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+    throw ControlError.system("fcntl", errno)
+  }
+}
+
+// makeSocket opens a UNIX stream socket with FD_CLOEXEC set.
+func makeSocket() throws -> Int32 {
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+  guard fd >= 0 else { throw ControlError.system("socket", errno) }
+  do {
+    try setCloseOnExec(fd)
+  } catch {
+    close(fd)
+    throw error
+  }
+  return fd
+}
+
 // configure keeps a write to a closed peer from raising SIGPIPE and bounds
 // how long reads and writes can block.
 func configure(_ fd: Int32, timeout seconds: Int) throws {

@@ -8,8 +8,7 @@ public enum ControlClient {
   public static func send(
     _ request: ControlRequest, to url: URL = ControlSocket.defaultURL
   ) throws -> ControlResponse {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { throw ControlError.system("socket", errno) }
+    let fd = try makeSocket()
     defer { close(fd) }
     try configure(fd, timeout: 10)
     let failure = try withAddress(url.path) { connect(fd, $0, $1) == 0 ? 0 : errno }

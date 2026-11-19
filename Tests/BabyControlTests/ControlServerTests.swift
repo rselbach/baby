@@ -56,6 +56,57 @@ private func connectIdle(to url: URL) throws -> Int32 {
 }
 
 @MainActor
+@Test func setsCloseOnExecOnControlSockets() async throws {
+  try await withSocketURL { url in
+    let server = try ControlServer(url: url) { _ in ControlResponse() }
+    defer { server.stop() }
+    let listenerFlags = fcntl(server.fileDescriptor, F_GETFD)
+    #expect(listenerFlags >= 0)
+    #expect(listenerFlags & FD_CLOEXEC != 0)
+  }
+
+  try await withSocketURL { url in
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let listener = try makeSocket()
+    defer { close(listener) }
+    let listenerFlags = fcntl(listener, F_GETFD)
+    #expect(listenerFlags >= 0)
+    #expect(listenerFlags & FD_CLOEXEC != 0)
+    try #require(try withAddress(url.path) { bind(listener, $0, $1) } == 0)
+    try #require(listen(listener, 4) == 0)
+
+    let peer = try connectIdle(to: url)
+    defer { close(peer) }
+    let accepted = try #require(ControlServer.acceptClient(on: listener))
+    defer { close(accepted) }
+    let clientFlags = fcntl(accepted, F_GETFD)
+    #expect(clientFlags >= 0)
+    #expect(clientFlags & FD_CLOEXEC != 0)
+  }
+}
+
+@Test(arguments: [0, -1])
+func rejectsNonPositiveMaximumConnections(limit: Int) async {
+  let directory = URL(filePath: "/tmp/baby-\(UUID().uuidString.prefix(8))")
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let url = directory.appending(path: "control.sock")
+  await #expect(processExitsWith: .failure) { [url = url as URL, limit] in
+    _ = try ControlServer(url: url, maximumConnections: limit) { _ in ControlResponse() }
+  }
+  #expect(!FileManager.default.fileExists(atPath: directory.path))
+}
+
+@MainActor
+@Test func allowsSingleConnectionLimit() async throws {
+  try await withSocketURL { url in
+    let server = try ControlServer(url: url, maximumConnections: 1) { _ in ControlResponse() }
+    defer { server.stop() }
+    #expect(try await send(ControlRequest(command: .status), to: url) == ControlResponse())
+  }
+}
+
+@MainActor
 @Test func turnsAwayConnectionsBeyondTheLimit() async throws {
   try await withSocketURL { url in
     let server = try ControlServer(url: url, maximumConnections: 2) { _ in ControlResponse() }
