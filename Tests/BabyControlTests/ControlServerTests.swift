@@ -17,13 +17,24 @@ private final class Recorder {
   var requests: [ControlRequest] = []
 }
 
+// onOwnThread keeps blocking socket calls off the cooperative pool. On a
+// runner with few cores, a few blocked clients fill the pool, and the server
+// can't get a thread to answer them until one times out.
+private func onOwnThread<T: Sendable>(
+  _ body: @escaping @Sendable () throws -> T
+) async throws -> T {
+  try await withCheckedThrowingContinuation { continuation in
+    Thread { continuation.resume(with: Result(catching: body)) }.start()
+  }
+}
+
 private func send(_ request: ControlRequest, to url: URL) async throws -> ControlResponse {
-  try await Task.detached { try ControlClient.send(request, to: url) }.value
+  try await onOwnThread { try ControlClient.send(request, to: url) }
 }
 
 // sendRaw writes bytes to the socket and returns the reply line.
 private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
-  try await Task.detached {
+  try await onOwnThread {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     #expect(fd >= 0)
     defer { close(fd) }
@@ -32,7 +43,7 @@ private func sendRaw(_ bytes: String, to url: URL) async throws -> String {
     #expect(status == 0)
     try writeMessage(fd, Data(bytes.utf8))
     return String(decoding: try readMessage(fd), as: UTF8.self)
-  }.value
+  }
 }
 
 // connectIdle opens a connection that never sends a request.
