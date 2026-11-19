@@ -36,39 +36,6 @@ func run(_ options: HoldOptions, command: [String]) -> Never {
   fail("\(command[0]): \(String(cString: strerror(code)))", status: code == ENOENT ? 127 : 126)
 }
 
-struct Status: Encodable {
-  let running: Bool
-  let awake: Bool
-  let leases: [Lease]
-}
-
-func printStatus(_ leases: [Lease]) {
-  guard !leases.isEmpty else {
-    print("Baby is not keeping your Mac awake.")
-    return
-  }
-  print("Baby is keeping your Mac awake for:")
-  let idWidth = leases.map(\.id.count).max() ?? 0
-  let labelWidth = leases.map(\.label.count).max() ?? 0
-  for lease in leases {
-    var details: [String] = []
-    if let deadline = lease.deadline {
-      let date: Date.FormatStyle.DateStyle =
-        Calendar.current.isDateInToday(deadline) ? .omitted : .abbreviated
-      details.append("until \(deadline.formatted(date: date, time: .shortened))")
-    }
-    if let pid = lease.pid {
-      details.append("while process \(pid) runs")
-    }
-    if details.isEmpty {
-      details.append("until released")
-    }
-    let id = lease.id.padding(toLength: idWidth, withPad: " ", startingAt: 0)
-    let label = lease.label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
-    print("  \(id)  \(label)  \(details.joined(separator: ", "))")
-  }
-}
-
 func status(json: Bool) throws {
   var leases: [Lease]?
   do {
@@ -81,7 +48,7 @@ func status(json: Bool) throws {
       print("Baby is not running.")
       return
     }
-    printStatus(leases)
+    print(formatStatus(leases))
     return
   }
   let status = Status(
