@@ -531,3 +531,113 @@ func waitsForAnInstallationBeforeQuitting(restart: Bool) async throws {
   // an expired feed doesn't count as seen, so it can't block a fresh one
   #expect(defaults.integer(forKey: "highestUpdateBuildSeen") == 0)
 }
+
+@MainActor
+@Test func throttlesDailyChecksAndHandlesClockSkewUsingInjectedClock() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+
+  let app = root.appending(path: "Baby.app", directoryHint: .isDirectory)
+  try buildAppBundle(at: app, version: "1.0.0", build: 5)
+  let current = try packageRelease(in: root, version: "1.0.0", build: 5)
+
+  let calls = OSAllocatedUnfairLock(initialState: 0)
+  let token = "updater-clock-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { _ in
+    calls.withLock { $0 += 1 }
+    return .init(body: current.feed)
+  }
+
+  let start = Date(timeIntervalSince1970: 1_700_000_000)
+  let clock = OSAllocatedUnfairLock(initialState: start)
+  let clockReads = OSAllocatedUnfairLock(initialState: 0)
+  let updater = Updater(
+    version: "1.0.0", build: 5, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement,
+    now: {
+      clockReads.withLock { $0 += 1 }
+      return clock.withLock { $0 }
+    })
+
+  // initial check runs and stamps lastUpdateCheck from the injected clock
+  await updater.checkIfDue()
+  #expect(updater.state == .upToDate)
+  #expect(calls.withLock { $0 } == 1)
+  #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == start)
+
+  // still throttled one second before 24 hours have elapsed, reading now() once
+  clock.withLock { $0 = start.addingTimeInterval(24 * 60 * 60 - 1) }
+  let readsBeforeThrottle = clockReads.withLock { $0 }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 1)
+  #expect(clockReads.withLock { $0 } == readsBeforeThrottle + 1)
+
+  // due again once 24 hours have elapsed
+  let nextDay = start.addingTimeInterval(24 * 60 * 60)
+  clock.withLock { $0 = nextDay }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 2)
+  #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == nextDay)
+
+  // clock skewed backward before lastUpdateCheck bypasses throttle and restamps
+  let skewed = nextDay.addingTimeInterval(-1)
+  clock.withLock { $0 = skewed }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 3)
+  #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == skewed)
+
+  // throttled again relative to the restamped time
+  clock.withLock { $0 = skewed.addingTimeInterval(60) }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 3)
+}
+
+@MainActor
+@Test func stampsInjectedClockWhenUpdateCannotBeReplacedInPlace() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: "updater-\(UUID())")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+  let suite = "baby.tests.\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+
+  let app = root.appending(components: "AppTranslocation", "Baby.app")
+  try buildAppBundle(at: app, version: "1.0.0", build: 1)
+  let next = try packageRelease(in: root, version: "1.1.0", build: 2)
+
+  let calls = OSAllocatedUnfairLock(initialState: 0)
+  let token = "updater-available-clock-\(UUID())"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { _ in
+    calls.withLock { $0 += 1 }
+    return .init(body: next.feed)
+  }
+
+  let start = Date(timeIntervalSince1970: 1_700_000_000)
+  let clock = OSAllocatedUnfairLock(initialState: start)
+  let updater = Updater(
+    version: "1.0.0", build: 1, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, now: { clock.withLock { $0 } })
+
+  await updater.checkIfDue()
+  #expect(updater.state == .available(version: "1.1.0", page: next.release.pageURL))
+  #expect(calls.withLock { $0 } == 1)
+  #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == start)
+
+  clock.withLock { $0 = start.addingTimeInterval(24 * 60 * 60 - 1) }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 1)
+
+  let nextDay = start.addingTimeInterval(24 * 60 * 60)
+  clock.withLock { $0 = nextDay }
+  await updater.checkIfDue()
+  #expect(calls.withLock { $0 } == 2)
+  #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == nextDay)
+}
