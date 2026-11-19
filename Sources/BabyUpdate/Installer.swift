@@ -7,14 +7,9 @@ public enum Installer {
   public static let stagingPrefix = ".baby-update-"
   static let recoveryMarker = "recovery-required"
 
-  // mark before swapping so a crash or failed rollback preserves the old app.
+  // mark before swapping so the old app stays protected until the updated build launches.
   static func preserveForRecovery(_ folder: URL) throws {
     try Data().write(to: folder.appending(path: recoveryMarker), options: .atomic)
-  }
-
-  static func allowCleanup(_ folder: URL) {
-    // a failed removal retains the recovery copy rather than risking its loss.
-    try? FileManager.default.removeItem(at: folder.appending(path: recoveryMarker))
   }
 
   /// Creates a new staging folder in `parent` named after `build` and this
@@ -100,11 +95,11 @@ public enum Installer {
   /// Deletes staging folders in `parent` whose owning process is gone; they
   /// hold a finished update's old bundle or an abandoned download.
   ///
-  /// A folder marked for recovery holds the only other copy of Baby from an
-  /// interrupted swap. It is deleted only once the bundle at `installed`
-  /// carries `runningBuild`: that proves the installed Baby is the one that
-  /// launched, so it works and the other copy is no longer needed. Without
-  /// both, recovery copies are always kept.
+  /// A folder marked for recovery holds the previous copy of Baby from a
+  /// bundle swap. It is deleted only once the bundle at `installed` carries
+  /// `runningBuild`: that proves the installed Baby is the one that launched,
+  /// so it works and the previous copy is no longer needed. Without both,
+  /// recovery copies are always kept.
   public static func removeLeftovers(
     in parent: URL, installed: URL? = nil, runningBuild: Int? = nil
   ) {
