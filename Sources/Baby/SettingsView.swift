@@ -186,6 +186,11 @@ struct SettingsView: View {
       }
     }
     .onAppear { toolInstalled = CommandLineTool.isInstalled(helper) }
+    .onReceive(
+      NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+    ) { _ in
+      toolInstalled = CommandLineTool.isInstalled(helper)
+    }
   }
 
   private func updates(_ updater: Updater) -> some View {
