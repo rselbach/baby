@@ -61,7 +61,7 @@ jobs:
         run: |
           missing=0
           # after a key rotation the app trusts a dedicated key, which must sign too
-          if ! grep -q 'public static let publicKeys = \[legacyPublicKey\]' \
+          if ! grep -qE '^[[:space:]]*public static let publicKeys = \[legacyPublicKey\][[:space:]]*$' \
             Sources/BabyUpdate/Feed.swift && [[ -z "${BABY_FEED_SIGNING_KEY}" ]]; then
             echo "::error::secret BABY_FEED_SIGNING_KEY is not set" >&2
             missing=1
@@ -242,15 +242,14 @@ jobs:
             after_args=(--after "${LIVE_FEED}")
           fi
           mkdir -p _site
-          build/baby-update-tool sign-feed \
+          scripts/feed-signing-keys.sh | build/baby-update-tool sign-feed \
             --version "${VERSION}" --build "${BUILD}" \
             --minimum-os "${minimum_os}" \
             --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
             --zip "build/${zip}" --zip-url "${base}/${zip}" \
             --dmg "build/${dmg}" --dmg-url "${base}/${dmg}" \
             ${after_args[@]+"${after_args[@]}"} \
-            --out _site/update.json \
-            < <(printf '%s\n' "${LEGACY_SIGNING_KEY}" "${FEED_SIGNING_KEY}")
+            --out _site/update.json
           if [[ -n "${LIVE_FEED}" ]]; then
             build/baby-update-tool verify-feed _site/update.json --after "${LIVE_FEED}"
           fi

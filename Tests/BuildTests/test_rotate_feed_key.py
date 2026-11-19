@@ -1,4 +1,4 @@
-"""Run rotate-feed-key.sh against stand-in swift, tool, and gh commands."""
+"""Test feed key rotation and workflow signing key selection."""
 
 import os
 from pathlib import Path
@@ -17,8 +17,8 @@ class RotateFeedKeyTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.checkout = self.root / "checkout"
-        for name in ("scripts/rotate-feed-key.sh", "Sources/BabyUpdate/Feed.swift",
-                     "site/site.js"):
+        for name in ("scripts/rotate-feed-key.sh", "scripts/feed-signing-keys.sh",
+                     "Sources/BabyUpdate/Feed.swift", "site/site.js"):
             (self.checkout / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / name, self.checkout / name)
         self.bin = self.root / "bin"
@@ -55,6 +55,18 @@ esac
             capture_output=True, text=True, env=env, timeout=30,
         )
 
+    def run_signing_keys(self, *args, legacy=None, feed=None):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LEGACY_SIGNING_KEY", "FEED_SIGNING_KEY")}
+        if legacy is not None:
+            env["LEGACY_SIGNING_KEY"] = legacy
+        if feed is not None:
+            env["FEED_SIGNING_KEY"] = feed
+        return subprocess.run(
+            ["/bin/bash", str(self.checkout / "scripts/feed-signing-keys.sh"), *args],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+
     def test_rotates_the_app_site_and_secret(self):
         seed = self.root / "seed.txt"
         result = self.run_script(str(seed))
@@ -81,6 +93,55 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(seed.read_text(), "keep me")
         self.assertFalse(self.secret.exists())
+
+    def test_unrotated_checkout_omits_dedicated_key_even_when_secret_is_set(self):
+        for dedicated in (None, "", "dedicated-seed"):
+            with self.subTest(dedicated=dedicated):
+                result = self.run_signing_keys(legacy="legacy-seed", feed=dedicated)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["legacy-seed"])
+
+    def test_rotated_checkout_includes_dedicated_key_and_rejects_missing_secret(self):
+        rotated = self.run_script(str(self.root / "seed.txt"))
+        self.assertEqual(rotated.returncode, 0, rotated.stderr)
+
+        both = self.run_signing_keys(legacy="legacy-seed", feed="dedicated-seed")
+        self.assertEqual(both.returncode, 0, both.stderr)
+        self.assertEqual(both.stdout.splitlines(), ["legacy-seed", "dedicated-seed"])
+
+        for dedicated in (None, ""):
+            with self.subTest(dedicated=dedicated):
+                missing = self.run_signing_keys(legacy="legacy-seed", feed=dedicated)
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertEqual(missing.stdout, "")
+                self.assertIn("FEED_SIGNING_KEY", missing.stderr)
+
+    def test_signing_keys_requires_legacy_key_and_feed_file(self):
+        for legacy in (None, ""):
+            with self.subTest(legacy=legacy):
+                missing = self.run_signing_keys(legacy=legacy, feed="dedicated-seed")
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertEqual(missing.stdout, "")
+                self.assertIn("LEGACY_SIGNING_KEY", missing.stderr)
+
+        absent = self.run_signing_keys(str(self.root / "missing.swift"),
+                                       legacy="legacy-seed", feed="dedicated-seed")
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertEqual(absent.stdout, "")
+
+    def test_workflows_select_signing_keys_for_the_checked_out_feed(self):
+        expectations = {
+            ".github/workflows/release.yml":
+                "scripts/feed-signing-keys.sh | build/baby-update-tool sign-feed",
+            ".github/workflows/refresh-feed.yml":
+                "scripts/feed-signing-keys.sh | build/baby-update-tool refresh-feed",
+        }
+        for path, snippet in expectations.items():
+            with self.subTest(workflow=path):
+                text = (REPO / path).read_text()
+                self.assertIn(snippet, text)
+                self.assertNotIn('printf \'%s\\n\' "${LEGACY_SIGNING_KEY}" "${FEED_SIGNING_KEY}"',
+                                 text)
 
 
 if __name__ == "__main__":
