@@ -56,9 +56,8 @@ jobs:
           FEED_SIGNING_KEY: ${{ secrets.BABY_FEED_SIGNING_KEY }}
         run: |
           mkdir -p _site
-          build/baby-update-tool refresh-feed "${RUNNER_TEMP}/live.json" \
-            --out _site/update.json \
-            < <(printf '%s\n' "${LEGACY_SIGNING_KEY}" "${FEED_SIGNING_KEY}")
+          scripts/feed-signing-keys.sh | build/baby-update-tool refresh-feed \
+            "${RUNNER_TEMP}/live.json" --out _site/update.json
           build/baby-update-tool verify-feed _site/update.json --after "${RUNNER_TEMP}/live.json"
           if cmp -s "${RUNNER_TEMP}/live.json" _site/update.json; then
             echo "changed=false" >>"${GITHUB_OUTPUT}"
