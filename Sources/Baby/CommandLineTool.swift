@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The baby command line tool inside Baby.app and its link in ~/.local/bin.
@@ -19,10 +20,14 @@ enum CommandLineTool {
 
   /// Links `helper` at `link`, replacing an earlier link to a Baby helper but
   /// never another file or a link to anything else.
-  static func install(_ helper: URL, at link: URL = CommandLineTool.link) throws {
+  static func install(
+    _ helper: URL,
+    at link: URL = CommandLineTool.link,
+    rename: (URL, URL) throws -> Void = atomicRename
+  ) throws {
     let files = FileManager.default
-    try files.createDirectory(
-      at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let directory = link.deletingLastPathComponent()
+    try files.createDirectory(at: directory, withIntermediateDirectories: true)
     if let destination = try? files.destinationOfSymbolicLink(atPath: link.path) {
       guard isBabyHelper(destination) else {
         throw CocoaError(
@@ -32,7 +37,6 @@ enum CommandLineTool {
               "\(link.path) links to \(destination). Remove it to install Baby's tool."
           ])
       }
-      try files.removeItem(at: link)
     } else if files.fileExists(atPath: link.path) {
       throw CocoaError(
         .fileWriteFileExists,
@@ -41,7 +45,25 @@ enum CommandLineTool {
             "\(link.path) already exists. Move it aside to install Baby's tool."
         ])
     }
-    try files.createSymbolicLink(at: link, withDestinationURL: helper)
+
+    // stage the new symlink beside `link` and rename it into place so `link`
+    // is never missing while replacing an earlier Baby link.
+    let temporary = directory.appending(
+      path: ".\(link.lastPathComponent)-\(UUID().uuidString)", directoryHint: .notDirectory)
+    try files.createSymbolicLink(at: temporary, withDestinationURL: helper)
+    do {
+      try rename(temporary, link)
+    } catch {
+      try? files.removeItem(at: temporary)
+      throw error
+    }
+  }
+
+  /// Atomically moves `source` onto `destination` on the same volume.
+  private static func atomicRename(_ source: URL, to destination: URL) throws {
+    guard Darwin.rename(source.path, destination.path) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
   }
 
   /// Whether `path` names the tool inside some app bundle, as in

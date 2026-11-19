@@ -53,3 +53,45 @@ private func temporaryFolder() throws -> URL {
   #expect(throws: CocoaError.self) { try CommandLineTool.install(helper, at: link) }
   #expect(try Data(contentsOf: link) == Data("#!/bin/sh\n".utf8))
 }
+
+@Test func leavesNoTemporaryLinkOnSuccessOrFailure() throws {
+  let root = try temporaryFolder()
+  defer { try? FileManager.default.removeItem(at: root) }
+  let bin = root.appending(path: "bin", directoryHint: .isDirectory)
+  let link = bin.appending(path: "baby")
+  let old = root.appending(path: "Old/Baby.app/Contents/Helpers/baby")
+  let new = root.appending(path: "New/Baby.app/Contents/Helpers/baby")
+
+  // fresh install and atomic replacement leave only the target link
+  try CommandLineTool.install(old, at: link)
+  #expect(try FileManager.default.contentsOfDirectory(atPath: bin.path) == ["baby"])
+
+  try CommandLineTool.install(new, at: link)
+  #expect(CommandLineTool.isInstalled(new, at: link))
+  #expect(try FileManager.default.contentsOfDirectory(atPath: bin.path) == ["baby"])
+
+  // a failed rename keeps the previous link intact and cleans up the staged link
+  var sawStagedLink = false
+  #expect(throws: POSIXError.self) {
+    try CommandLineTool.install(old, at: link) { temporary, destination in
+      sawStagedLink = true
+      #expect(temporary.deletingLastPathComponent().standardizedFileURL == bin.standardizedFileURL)
+      #expect(destination == link)
+      #expect(try FileManager.default.destinationOfSymbolicLink(atPath: temporary.path) == old.path)
+      #expect(CommandLineTool.isInstalled(new, at: link))
+      throw POSIXError(.EIO)
+    }
+  }
+  #expect(sawStagedLink)
+  #expect(CommandLineTool.isInstalled(new, at: link))
+  #expect(try FileManager.default.contentsOfDirectory(atPath: bin.path) == ["baby"])
+
+  // a failed fresh install leaves the directory empty
+  try FileManager.default.removeItem(at: link)
+  #expect(throws: POSIXError.self) {
+    try CommandLineTool.install(old, at: link) { _, _ in
+      throw POSIXError(.EIO)
+    }
+  }
+  #expect(try FileManager.default.contentsOfDirectory(atPath: bin.path).isEmpty)
+}
