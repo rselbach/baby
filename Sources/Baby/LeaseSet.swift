@@ -78,6 +78,25 @@ struct LeaseSet {
     leases[index] = lease
   }
 
+  /// Builds and adds the lease `request` asks to hold, ensuring an
+  /// auto-generated ID does not collide with an existing lease or `userID`.
+  @discardableResult
+  mutating func hold(
+    _ request: ControlRequest,
+    now: Date,
+    isRunning: (Int32) -> Bool,
+    generateID: () -> String = Lease.randomID
+  ) throws(LeaseRequestError) -> Lease {
+    let lease = try Lease(
+      holding: request,
+      now: now,
+      isRunning: isRunning,
+      existingIDs: Set(leases.map(\.id)),
+      generateID: generateID)
+    try hold(lease)
+    return lease
+  }
+
   /// Removes the leases matching `shouldRemove`.
   mutating func removeAll(where shouldRemove: (Lease) -> Bool) {
     leases.removeAll(where: shouldRemove)
@@ -103,17 +122,33 @@ extension Lease {
   /// The longest duration a hold request can ask for, matching the menu's
   /// longest preset.
   static let maximumSeconds = Double(UInt32.max)
+  private static let maximumIDAttempts = 1000
   private static let idCharacters = Set(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
+  /// Generates a short random lease ID.
+  static func randomID() -> String {
+    UUID().uuidString.prefix(8).lowercased()
+  }
+
   /// Builds the lease `request` asks to hold. A request without an ID gets
-  /// a random one, and one without a label is labeled with its ID.
-  init(holding request: ControlRequest, now: Date, isRunning: (Int32) -> Bool)
-    throws(LeaseRequestError)
-  {
-    let id = request.id ?? UUID().uuidString.prefix(8).lowercased()
-    guard id != LeaseSet.userID else {
-      throw LeaseRequestError(message: "The lease ID \"user\" is reserved for Baby's menu.")
+  /// a random one that avoids `existingIDs` and `LeaseSet.userID`, and one
+  /// without a label is labeled with its ID.
+  init(
+    holding request: ControlRequest,
+    now: Date,
+    isRunning: (Int32) -> Bool,
+    existingIDs: Set<String> = [],
+    generateID: () -> String = Self.randomID
+  ) throws(LeaseRequestError) {
+    let id: String
+    if let explicitID = request.id {
+      guard explicitID != LeaseSet.userID else {
+        throw LeaseRequestError(message: "The lease ID \"user\" is reserved for Baby's menu.")
+      }
+      id = explicitID
+    } else {
+      id = try Self.uniqueID(avoiding: existingIDs, generate: generateID)
     }
     var deadline: Date?
     if let seconds = request.seconds {
@@ -149,6 +184,19 @@ extension Lease {
       bytes += size
     }
     return label
+  }
+
+  private static func uniqueID(
+    avoiding existingIDs: Set<String>,
+    generate: () -> String
+  ) throws(LeaseRequestError) -> String {
+    for _ in 0..<maximumIDAttempts {
+      let candidate = generate()
+      if candidate != LeaseSet.userID, !existingIDs.contains(candidate) {
+        return candidate
+      }
+    }
+    throw LeaseRequestError(message: "Could not generate a unique lease ID.")
   }
 
   fileprivate func validate() throws(LeaseRequestError) {

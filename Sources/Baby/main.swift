@@ -148,9 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .hold:
       let lease: Lease
       do {
-        lease = try Lease(holding: request, now: Date(), isRunning: processIsRunning)
-        leases.removeFinished(now: Date(), isRunning: processIsRunning)
-        try leases.hold(lease)
+        let now = Date()
+        leases.removeFinished(now: now, isRunning: processIsRunning)
+        lease = try leases.hold(request, now: now, isRunning: processIsRunning)
       } catch {
         return ControlResponse(error: error.message)
       }
