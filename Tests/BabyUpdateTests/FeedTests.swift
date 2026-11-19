@@ -287,9 +287,10 @@ private let launch = Date(timeIntervalSince1970: 1_800_000_000)
 
   // older builds read only `signature`, which the first key signs
   let fields = try JSONSerialization.jsonObject(with: feed) as? [String: Any]
-  let payload = try #require(Data(base64Encoded: try #require(fields?["payload"] as? String)))
-  let signature = try #require(
-    Data(base64Encoded: try #require(fields?["signature"] as? String)))
+  let payloadText = try #require(fields?["payload"] as? String)
+  let signatureText = try #require(fields?["signature"] as? String)
+  let payload = try #require(Data(base64Encoded: payloadText))
+  let signature = try #require(Data(base64Encoded: signatureText))
   #expect(key.publicKey.isValidSignature(signature, for: Feed.signingContext + payload))
   #expect((fields?["signatures"] as? [String])?.count == 1)
 }
