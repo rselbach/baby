@@ -51,7 +51,15 @@ from urllib.parse import urlparse
 args = sys.argv[1:]
 root = Path(os.environ["TEST_ROOT"])
 if "-I" in args:
-    print("Content-Security-Policy: connect-src https://rselbach.github.io")
+    omit = os.environ.get("OMIT_HEADER", "").lower()
+    headers = (
+        ("Content-Security-Policy", "connect-src https://rselbach.github.io"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "strict-origin-when-cross-origin"),
+    )
+    for name, value in headers:
+        if name.lower() != omit:
+            sys.stdout.write(f"{name}: {value}\\r\\n")
     raise SystemExit(0)
 if "-w" in args:
     print("https://rselbach.com/baby/", end="")
@@ -191,6 +199,57 @@ Path(args[args.index("-o") + 1]).write_bytes(source.read_bytes())
         self.assertEqual(status, 0, output)
         self.assertEqual((self.current / "baby/index.html").read_text(), "second index.html")
         self.assertEqual(self.snippet.read_text(), "second snippet\n")
+
+    def test_missing_security_header_restores_files_and_running_configuration(self):
+        for header in (
+            "Content-Security-Policy",
+            "X-Content-Type-Options",
+            "Referrer-Policy",
+        ):
+            with self.subTest(header=header):
+                reloads = self.root / "reloads"
+                reloads.unlink(missing_ok=True)
+                self.assert_restored(OMIT_HEADER=header)
+                self.assertEqual(reloads.read_text(), "2")
+
+    def test_nginx_locations_with_add_header_preserve_security_headers(self):
+        config = (Path(__file__).resolve().parents[2] / "site-nginx.conf").read_text()
+        blocks = []
+        stack = []
+        for raw_line in config.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("location ") and line.endswith("{"):
+                block = {"header": line, "directives": []}
+                blocks.append(block)
+                stack.append(block)
+            elif line.endswith("{"):
+                stack.append(None)
+            elif line == "}":
+                stack.pop()
+            elif stack and stack[-1] is not None and line.startswith("add_header "):
+                stack[-1]["directives"].append(line)
+
+        with_headers = [block for block in blocks if block["directives"]]
+        self.assertIn("location ^~ /baby/ {", [block["header"] for block in with_headers])
+        for block in with_headers:
+            headers = {}
+            for directive in block["directives"]:
+                self.assertTrue(
+                    directive.endswith(" always;"),
+                    f"{block['header']}: missing always on {directive}",
+                )
+                parts = directive.removesuffix(" always;").split(None, 2)
+                self.assertEqual(len(parts), 3, directive)
+                headers[parts[1].lower()] = parts[2]
+            self.assertIn("content-security-policy", headers, block["header"])
+            self.assertEqual(headers.get("x-content-type-options"), '"nosniff"', block["header"])
+            self.assertEqual(
+                headers.get("referrer-policy"),
+                '"strict-origin-when-cross-origin"',
+                block["header"],
+            )
 
 
 if __name__ == "__main__":

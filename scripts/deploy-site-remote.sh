@@ -63,7 +63,12 @@ verify() {
   local curl_flags=(-fsS --connect-timeout 10 --max-time 30)
   headers="$(curl "${curl_flags[@]}" -I \
     "${URL}?deployment=${release##*/}")"
+  headers="${headers//$'\r'/}"
   grep -qi '^content-security-policy:.*connect-src https://rselbach.github.io' \
+    <<<"${headers}"
+  grep -Eiq '^x-content-type-options:[[:space:]]*nosniff[[:space:]]*$' \
+    <<<"${headers}"
+  grep -Eiq '^referrer-policy:[[:space:]]*strict-origin-when-cross-origin[[:space:]]*$' \
     <<<"${headers}"
   location="$(curl "${curl_flags[@]}" -o /dev/null -w '%{redirect_url}' \
     "${URL%/}")"
