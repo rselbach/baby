@@ -145,7 +145,7 @@ public final class Updater {
       case .install(let release, let artifact):
         guard let parent = replaceableParent() else {
           state = .available(version: release.version, page: release.pageURL)
-          defaults.set(Date(), forKey: Key.lastCheck)
+          defaults.set(now(), forKey: Key.lastCheck)
           return
         }
         state = .downloading(version: release.version)
@@ -154,7 +154,7 @@ public final class Updater {
           requirement: codeRequirement)
         state = .ready(version: release.version)
       }
-      defaults.set(Date(), forKey: Key.lastCheck)
+      defaults.set(now(), forKey: Key.lastCheck)
     } catch {
       state = .failed(error.localizedDescription)
     }
@@ -247,10 +247,11 @@ public final class Updater {
 
   func checkIfDue() async {
     guard automaticChecks else { return }
-    if let last = defaults.object(forKey: Key.lastCheck) as? Date,
-      last <= Date(), Date().timeIntervalSince(last) < Self.checkInterval
-    {
-      return
+    if let last = defaults.object(forKey: Key.lastCheck) as? Date {
+      let current = now()
+      if last <= current, current.timeIntervalSince(last) < Self.checkInterval {
+        return
+      }
     }
     await check()
   }
