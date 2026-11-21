@@ -13,17 +13,25 @@ struct LeaseSet {
 
   init() {}
 
-  /// Restores the leases an earlier Baby passed along. Throws only when
-  /// `data` isn't a list of leases at all; a lease that can't be held is
-  /// skipped, and why goes in `rejected`, so one bad lease doesn't drop the rest.
-  init(restoring data: Data, rejected: inout [String]) throws {
-    for lease in try ControlCoding.decoder().decode([Lease].self, from: data) {
+  /// Restores `leases` one by one, skipping any that can't be held and
+  /// recording why in `rejected`, so one bad lease doesn't drop the rest.
+  init(restoring leases: [Lease], rejected: inout [String]) {
+    for lease in leases {
       do {
         try hold(lease)
       } catch {
         rejected.append("\(lease.id): \(error.message)")
       }
     }
+  }
+
+  /// Restores the leases an earlier Baby passed along. Throws only when
+  /// `data` isn't a list of leases at all; a lease that can't be held is
+  /// skipped, and why goes in `rejected`, so one bad lease doesn't drop the rest.
+  init(restoring data: Data, rejected: inout [String]) throws {
+    self.init(
+      restoring: try ControlCoding.decoder().decode([Lease].self, from: data),
+      rejected: &rejected)
   }
 
   init(restoring data: Data) throws {
