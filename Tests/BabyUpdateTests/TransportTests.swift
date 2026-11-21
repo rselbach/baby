@@ -11,11 +11,15 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     var headers: [String: String] = [:]
     var redirectTo: URL?
     var body: Data = Data()
+    var chunks: [Data]? = nil
+    var suspendAfterBody: (@Sendable () -> Void)? = nil
+    var onStop: (@Sendable () -> Void)? = nil
   }
 
   private static let handlers = OSAllocatedUnfairLock<
     [String: @Sendable (URLRequest) throws -> Response]
   >(initialState: [:])
+  private let onStop = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
 
   static func register(
     _ token: String,
@@ -41,6 +45,9 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     }
     do {
       let result = try handler(request)
+      if let stop = result.onStop {
+        onStop.withLock { $0 = stop }
+      }
       if let target = result.redirectTo {
         var headers = result.headers
         headers["Location"] = target.absoluteString
@@ -57,8 +64,16 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         url: url, statusCode: result.status, httpVersion: "HTTP/1.1",
         headerFields: result.headers)!
       client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-      if !result.body.isEmpty {
+      if let chunks = result.chunks {
+        for chunk in chunks where !chunk.isEmpty {
+          client?.urlProtocol(self, didLoad: chunk)
+        }
+      } else if !result.body.isEmpty {
         client?.urlProtocol(self, didLoad: result.body)
+      }
+      if let onSuspended = result.suspendAfterBody {
+        onSuspended()
+        return
       }
       client?.urlProtocolDidFinishLoading(self)
     } catch {
@@ -66,7 +81,14 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     }
   }
 
-  override func stopLoading() {}
+  override func stopLoading() {
+    let stop = onStop.withLock { cb -> (@Sendable () -> Void)? in
+      let current = cb
+      cb = nil
+      return current
+    }
+    stop?()
+  }
 }
 
 func makeMockTransport(
@@ -209,4 +231,138 @@ private func sha256(_ data: Data) -> String {
     #expect(!followedBlockedRedirect.withLock { $0 })
     #expect(!FileManager.default.fileExists(atPath: badDest.path))
   }
+}
+
+@Test func downloadsMultiChunkPayloadAndRejectsOverflowMidChunk() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appending(path: "transport-\(UUID().uuidString)", directoryHint: .isDirectory)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+
+  let chunks = [
+    Data(repeating: 0x41, count: 40 * 1024),
+    Data(repeating: 0x42, count: 50 * 1024),
+    Data(repeating: 0x43, count: 30 * 1024),
+  ]
+  let payload = chunks.reduce(into: Data()) { $0.append($1) }
+  let url = UpdateConfig.artifactPrefix + "v1.0.0/Baby-multi.zip"
+  let artifact = Artifact(
+    arch: "arm64", minimumOS: "14.0", url: url, size: Int64(payload.count),
+    sha256: sha256(payload))
+
+  let okToken = "multi-ok-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(okToken) }
+  let okTransport = makeMockTransport(okToken) { _ in
+    .init(chunks: chunks)
+  }
+  let okDest = root.appending(path: "multi.zip")
+  try await okTransport.download(artifact, to: okDest)
+  #expect(try Data(contentsOf: okDest) == payload)
+
+  // Exceeding the limit mid-chunk rejects with .tooLarge and removes the file
+  let smallExpected = Data("0123456789".utf8)
+  let smallArtifact = Artifact(
+    arch: "arm64", minimumOS: "14.0", url: url, size: Int64(smallExpected.count),
+    sha256: sha256(smallExpected))
+
+  let overflowToken = "multi-overflow-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(overflowToken) }
+  let overflowTransport = makeMockTransport(overflowToken) { _ in
+    .init(chunks: [Data("012345".utf8), Data("6789EXTRA".utf8), Data("MORE".utf8)])
+  }
+  let overflowDest = root.appending(path: "overflow.zip")
+  await #expect(throws: TransportError.tooLarge) {
+    try await overflowTransport.download(smallArtifact, to: overflowDest)
+  }
+  #expect(!FileManager.default.fileExists(atPath: overflowDest.path))
+
+  // Content-Length above limit rejects before streaming body
+  let headerToken = "header-overflow-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(headerToken) }
+  let headerTransport = makeMockTransport(headerToken) { _ in
+    .init(headers: ["Content-Length": "11"], body: Data("01234".utf8))
+  }
+  let headerDest = root.appending(path: "header-overflow.zip")
+  await #expect(throws: TransportError.tooLarge) {
+    try await headerTransport.download(smallArtifact, to: headerDest)
+  }
+  #expect(!FileManager.default.fileExists(atPath: headerDest.path))
+}
+
+@Test func cancelsInFlightAndPreCancelledDownloads() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appending(path: "transport-\(UUID().uuidString)", directoryHint: .isDirectory)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+
+  let payload = Data("0123456789".utf8)
+  let url = UpdateConfig.artifactPrefix + "v1.0.0/Baby-cancel.zip"
+  let artifact = Artifact(
+    arch: "arm64", minimumOS: "14.0", url: url, size: Int64(payload.count),
+    sha256: sha256(payload))
+
+  // In-flight cancellation stops the URLSessionDataTask and removes the partial file
+  let (started, startedContinuation) = AsyncStream.makeStream(of: Void.self)
+  let (stopped, stoppedContinuation) = AsyncStream.makeStream(of: Void.self)
+  let token = "cancel-inflight-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(token) }
+  let transport = makeMockTransport(token) { _ in
+    .init(
+      chunks: [Data("0123".utf8)],
+      suspendAfterBody: {
+        startedContinuation.yield()
+        startedContinuation.finish()
+      },
+      onStop: {
+        stoppedContinuation.yield()
+        stoppedContinuation.finish()
+      }
+    )
+  }
+
+  let dest = root.appending(path: "inflight.zip")
+  let downloadTask = Task {
+    try await transport.download(artifact, to: dest)
+  }
+  for await _ in started {}
+  downloadTask.cancel()
+  let inFlightError = await #expect(throws: URLError.self) {
+    try await downloadTask.value
+  }
+  #expect(inFlightError?.code == .cancelled)
+  let didStop = await withTaskGroup(of: Bool.self) { group in
+    group.addTask {
+      for await _ in stopped { return true }
+      return false
+    }
+    group.addTask {
+      try? await Task.sleep(for: .seconds(5))
+      return false
+    }
+    let first = await group.next() ?? false
+    group.cancelAll()
+    return first
+  }
+  #expect(didStop)
+  #expect(!FileManager.default.fileExists(atPath: dest.path))
+
+  // Pre-cancelled task fails with URLError.cancelled without starting the request
+  let called = OSAllocatedUnfairLock(initialState: false)
+  let preToken = "cancel-pre-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(preToken) }
+  let preTransport = makeMockTransport(preToken) { _ in
+    called.withLock { $0 = true }
+    return .init(body: payload)
+  }
+  let preDest = root.appending(path: "precancel.zip")
+  let preCancelled = Task {
+    withUnsafeCurrentTask { $0?.cancel() }
+    try await preTransport.download(artifact, to: preDest)
+  }
+  let preError = await #expect(throws: URLError.self) {
+    try await preCancelled.value
+  }
+  #expect(preError?.code == .cancelled)
+  #expect(!called.withLock { $0 })
+  #expect(!FileManager.default.fileExists(atPath: preDest.path))
 }
