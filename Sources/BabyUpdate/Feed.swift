@@ -195,6 +195,12 @@ public enum Feed {
   public static func open(
     _ data: Data, publicKeys: [Curve25519.Signing.PublicKey]
   ) throws -> Release {
+    try openEnvelope(data, publicKeys: publicKeys).release
+  }
+
+  private static func openEnvelope(
+    _ data: Data, publicKeys: [Curve25519.Signing.PublicKey]
+  ) throws -> (release: Release, message: Data, signatures: [Data]) {
     guard data.count <= maxBytes else { throw FeedError.tooLarge }
     guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
       let payload = Data(base64Encoded: envelope.payload)
@@ -213,7 +219,7 @@ public enum Feed {
     guard let release = try? JSONDecoder().decode(Release.self, from: payload)
     else { throw FeedError.malformed }
     try release.validate()
-    return release
+    return (release, message, signatures)
   }
 
   /// Signs a release into a feed envelope with one key.
@@ -247,7 +253,7 @@ public enum Feed {
 
   /// Signs a release to succeed `live` (if any), reusing the verified `live`
   /// feed on an idempotent rerun when `publishedAt` was not pinned. A rerun
-  /// re-signs `live` with a later expiry only if it is close to expiring.
+  /// re-signs `live` if it is close to expiring or missing a required signature.
   public static func publish(
     version: String, build: Int, publishedAt: String? = nil, notesURL: String?,
     artifacts: [Artifact], privateKey: Curve25519.Signing.PrivateKey,
@@ -295,19 +301,24 @@ public enum Feed {
     return (feed, release)
   }
 
-  /// Returns `live` verbatim while it has more than ``refreshMargin`` left,
-  /// and otherwise re-signs the same release to expire ``validity`` from now.
+  /// Returns `live` verbatim while it has more than ``refreshMargin`` left
+  /// and carries valid signatures for every key in `privateKeys`, and
+  /// otherwise re-signs the same release with all `privateKeys`, extending
+  /// expiry to ``validity`` from now when within ``refreshMargin``.
   public static func refresh(
     _ live: Data, privateKeys: [Curve25519.Signing.PrivateKey],
     publicKeys: [Curve25519.Signing.PublicKey], now: Date = Date()
   ) throws -> (feed: Data, release: Release) {
     try requireSigners(privateKeys, for: publicKeys)
-    let current = try open(live, publicKeys: publicKeys)
-    if let expiry = current.expiryDate, expiry.timeIntervalSince(now) > refreshMargin {
+    let (current, message, signatures) = try openEnvelope(live, publicKeys: publicKeys)
+    let isFresh = current.expiryDate.map { $0.timeIntervalSince(now) > refreshMargin } ?? false
+    if isFresh && carriesAllSignatures(signatures, for: message, privateKeys: privateKeys) {
       return (live, current)
     }
     var release = current
-    release.expiresAt = ISO8601DateFormatter().string(from: now.addingTimeInterval(validity))
+    if !isFresh {
+      release.expiresAt = ISO8601DateFormatter().string(from: now.addingTimeInterval(validity))
+    }
     try release.validate()
     try release.verifySupersedes(current)
     let feed = try seal(release, privateKeys: privateKeys)
@@ -315,6 +326,23 @@ public enum Feed {
       throw FeedError.malformed
     }
     return (feed, release)
+  }
+
+  // carriesAllSignatures checks that the primary signature is by the first
+  // key (the legacy slot older builds read) and every remaining key also has
+  // a valid signature in the envelope.
+  private static func carriesAllSignatures(
+    _ signatures: [Data], for message: Data,
+    privateKeys: [Curve25519.Signing.PrivateKey]
+  ) -> Bool {
+    guard let first = privateKeys.first,
+      let primary = signatures.first,
+      primary.count == 64,
+      first.publicKey.isValidSignature(primary, for: message)
+    else { return false }
+    return privateKeys.dropFirst().allSatisfy { key in
+      signatures.contains { $0.count == 64 && key.publicKey.isValidSignature($0, for: message) }
+    }
   }
 
   // requireSigners fails early when the feed wouldn't verify for this build.
