@@ -104,6 +104,13 @@ package_dmg() {
   hdiutil verify "${dmg}"
 }
 
+app_authority() {
+  # drain upstream output so pipefail does not fail with SIGPIPE
+  codesign --display --verbose=2 "${APP}" 2>&1 \
+    | sed -n 's/^Authority=//p' \
+    | awk 'NR == 1'
+}
+
 # extracts the SHA-1 fingerprint of Baby.app's leaf signing certificate so DMG
 # signing uses the exact certificate even when two share a Common Name
 app_leaf_sha1() {
@@ -152,8 +159,7 @@ main() {
 
   VERSION="${VERSION}" BUILD="${BUILD}" "${ROOT}/build.sh"
   local authority
-  authority="$(codesign --display --verbose=2 "${APP}" 2>&1 \
-    | sed -n 's/^Authority=//p' | head -n 1)"
+  authority="$(app_authority)"
   local dmg_identity=""
   if [[ "${notarized}" == "true" ]]; then
     if [[ "${authority}" != "Developer ID Application:"* ]]; then

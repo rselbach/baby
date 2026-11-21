@@ -10,6 +10,29 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: ShellCheck
+        run: shellcheck ./*.sh scripts/*.sh
+
+      - name: Actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}" \
+            -o "${RUNNER_TEMP}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -shellcheck=shellcheck
+
   test:
     runs-on: xcode-27
     timeout-minutes: 20
@@ -23,6 +46,7 @@ jobs:
       - name: Test release tooling and website
         run: |
           python3 Tests/BuildTests/test_versions.py
+          python3 Tests/BuildTests/test_signing.py
           python3 Tests/BuildTests/test_rotate_feed_key.py
           python3 Tests/DeploymentTests/test_deploy_site.py
           python3 Tests/DeploymentTests/test_feed_succession.py
