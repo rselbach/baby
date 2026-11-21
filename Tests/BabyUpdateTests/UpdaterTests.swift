@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Observation
 import Testing
 import os
 
@@ -108,10 +109,17 @@ private func installedBuild(at app: URL) -> String? {
     return .init(body: current.feed)
   }
 
+  let now = Date(timeIntervalSince1970: 1_700_000_000)
+  let clockReads = OSAllocatedUnfairLock(initialState: 0)
   let updater = Updater(
     version: "1.0.0", build: 5, bundleURL: app, defaults: defaults, transport: transport,
     os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
-    codeRequirement: adHocRequirement)
+    codeRequirement: adHocRequirement,
+    now: {
+      clockReads.withLock { $0 += 1 }
+      return now
+    },
+    launchDelay: .milliseconds(20))
 
   await updater.checkIfDue()
   guard case .failed = updater.state else {
@@ -130,9 +138,67 @@ private func installedBuild(at app: URL) -> String? {
   await updater.checkIfDue()
   #expect(calls.withLock { $0 } == 2)
 
+  let readsBeforeStart = clockReads.withLock { $0 }
   updater.start()
-  try await Task.sleep(for: .seconds(11))
+  let deadline = ContinuousClock.now + .seconds(5)
+  while clockReads.withLock({ $0 }) == readsBeforeStart, ContinuousClock.now < deadline {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(clockReads.withLock { $0 } == readsBeforeStart + 1)
+  #expect(updater.state == .upToDate)
   #expect(calls.withLock { $0 } == 2)
+}
+
+@MainActor
+@Test func startTriggersDueCheckAfterLaunchDelay() async throws {
+  #expect(Updater.defaultLaunchDelay == .seconds(10))
+
+  let root = FileManager.default.temporaryDirectory
+    .appending(path: "updater-\(UUID().uuidString)", directoryHint: .isDirectory)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+
+  let suite = "baby.tests.\(UUID().uuidString)"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+
+  let app = root.appending(path: "Baby.app", directoryHint: .isDirectory)
+  try buildAppBundle(at: app, version: "1.0.0", build: 5)
+  let current = try packageRelease(in: root, version: "1.0.0", build: 5)
+
+  let calls = OSAllocatedUnfairLock(initialState: 0)
+  let token = "updater-start-due-\(UUID().uuidString)"
+  defer { MockURLProtocol.unregister(token) }
+
+  let transport = makeMockTransport(token) { _ in
+    calls.withLock { $0 += 1 }
+    return .init(body: current.feed)
+  }
+
+  let launchDelay: Duration = .milliseconds(50)
+  let updater = Updater(
+    version: "1.0.0", build: 5, bundleURL: app, defaults: defaults, transport: transport,
+    os: OSVersion("14.5")!, arch: "arm64", publicKey: signingKey.publicKey,
+    codeRequirement: adHocRequirement, launchDelay: launchDelay)
+
+  let checkingAt = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
+  withObservationTracking {
+    _ = updater.state
+  } onChange: {
+    let changedAt = ContinuousClock.now
+    checkingAt.withLock { if $0 == nil { $0 = changedAt } }
+  }
+
+  let started = ContinuousClock.now
+  updater.start()
+  let deadline = started + .seconds(5)
+  while updater.state == .idle || updater.state == .checking, ContinuousClock.now < deadline {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  let enteredChecking = try #require(checkingAt.withLock { $0 })
+  #expect(enteredChecking - started >= launchDelay)
+  #expect(updater.state == .upToDate)
+  #expect(calls.withLock { $0 } == 1)
 }
 
 @MainActor
