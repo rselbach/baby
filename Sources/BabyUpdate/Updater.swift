@@ -35,7 +35,7 @@ public final class Updater {
     let app: URL
   }
 
-  private static let launchDelay: Duration = .seconds(10)
+  static let defaultLaunchDelay: Duration = .seconds(10)
   private static let pollInterval: TimeInterval = 60 * 60
   private static let checkInterval: TimeInterval = 24 * 60 * 60
   private static let restartStagingLimit: Duration = .seconds(60)
@@ -59,6 +59,7 @@ public final class Updater {
   private let codeRequirement: String
   private let relaunch: @Sendable ([String]) throws -> Void
   private let now: @Sendable () -> Date
+  private let launchDelay: Duration
   private var staged: Staged?
   private var timer: Timer?
   private var installationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -93,7 +94,8 @@ public final class Updater {
     relaunch: @escaping @Sendable ([String]) throws -> Void = {
       try Installer.runAfterExit(of: getpid(), $0)
     },
-    now: @escaping @Sendable () -> Date = { Date() }
+    now: @escaping @Sendable () -> Date = { Date() },
+    launchDelay: Duration = defaultLaunchDelay
   ) {
     self.version = version
     self.build = build
@@ -106,6 +108,7 @@ public final class Updater {
     self.codeRequirement = codeRequirement
     self.relaunch = relaunch
     self.now = now
+    self.launchDelay = launchDelay
     self.automaticChecks = defaults.object(forKey: Key.automaticChecks) as? Bool ?? true
   }
 
@@ -118,7 +121,7 @@ public final class Updater {
       Installer.removeLeftovers(in: parent, installed: installed, runningBuild: build)
     }
     Task {
-      try? await Task.sleep(for: Self.launchDelay)
+      try? await Task.sleep(for: launchDelay)
       await checkIfDue()
     }
     timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) {
