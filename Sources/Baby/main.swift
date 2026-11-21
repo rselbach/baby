@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var server: ControlServer?
   private var settingsWindow: NSWindow?
   private var menuIsOpen = false
+  private var willRelaunchForUpdate = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     guard startServer() else {
@@ -105,26 +106,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func restoreLaunchState() {
+    let handoff: [Lease]?
+    switch RelaunchHandoff.consume() {
+    case .leases(let restored):
+      handoff = restored
+    case .absent:
+      handoff = nil
+    case .stale:
+      log.notice("discarded stale relaunch handoff")
+      handoff = nil
+    case .corrupt(let reason):
+      log.error("could not read relaunch handoff: \(reason, privacy: .public)")
+      handoff = nil
+    }
     let state = LaunchState(
       arguments: CommandLine.arguments,
-      activateOnLaunch: UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch))
+      activateOnLaunch: UserDefaults.standard.bool(forKey: SettingsKey.activateOnLaunch),
+      handoff: handoff)
     switch state {
+    case .handoff(let restored):
+      restore(restored)
     case .leases(let data):
       do {
-        var rejected: [String] = []
-        leases = try LeaseSet(restoring: data, rejected: &rejected)
-        for reason in rejected {
-          log.error("skipped a lease while restoring: \(reason, privacy: .public)")
-        }
+        restore(try ControlCoding.decoder().decode([Lease].self, from: data))
       } catch {
         log.error("could not restore leases: \(error.localizedDescription, privacy: .public)")
+        presentFailure(apply())
       }
-      presentFailure(apply())
     case .awake(let deadline):
       holdForUser(until: deadline)
     case .asleep:
       break
     }
+  }
+
+  private func restore(_ restored: [Lease]) {
+    var rejected: [String] = []
+    leases = LeaseSet(restoring: restored, rejected: &rejected)
+    for reason in rejected {
+      log.error("skipped a lease while restoring: \(reason, privacy: .public)")
+    }
+    presentFailure(apply())
   }
 
   private func startServer() -> Bool {
@@ -231,6 +253,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    if willRelaunchForUpdate {
+      if updater?.state == .installed {
+        do {
+          try RelaunchHandoff.write(leases.leases)
+        } catch {
+          log.error(
+            "could not write relaunch handoff: \(error.localizedDescription, privacy: .public)")
+        }
+      } else {
+        RelaunchHandoff.remove()
+      }
+    }
     server?.stop()
   }
 
@@ -288,10 +322,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .ready:
       Task {
         if await updater.restartToUpdate(launchArguments: {
-          LaunchState.relaunchArguments(for: self.leases.leases)
+          self.willRelaunchForUpdate = true
+          do {
+            try RelaunchHandoff.write(self.leases.leases)
+            return ["--asleep"]
+          } catch {
+            self.log.error(
+              "could not write relaunch handoff: \(error.localizedDescription, privacy: .public)")
+            return LaunchState.relaunchArguments(for: self.leases.leases)
+          }
         }) {
           NSApp.terminate(nil)
         } else {
+          if willRelaunchForUpdate {
+            willRelaunchForUpdate = false
+            RelaunchHandoff.remove()
+          }
           presentUpdateResult()
         }
       }
