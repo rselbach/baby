@@ -20,9 +20,10 @@ signing_identity() {
     return
   fi
   local sha1
+  # drain upstream output so pipefail does not fail with SIGPIPE
   sha1="$(security find-identity -v -p codesigning \
     | sed -n "s/^[[:space:]]*[0-9][0-9]*)[[:space:]]*\([0-9A-F]\{40\}\)[[:space:]]*\"${DEVELOPER_ID}: .* (${TEAM_ID})\".*/\1/p" \
-    | head -n 1)"
+    | awk 'NR == 1')"
   if [[ -n "${sha1}" ]]; then
     echo "${sha1}"
     return
