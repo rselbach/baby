@@ -29,7 +29,7 @@ public final class Updater {
   }
 
   // a staged update: the verified Baby.app inside its staging folder
-  private struct Staged: Sendable {
+  struct Staged: Sendable {
     let release: Release
     let folder: URL
     let app: URL
@@ -293,18 +293,28 @@ public final class Updater {
   // stage downloads and unpacks the release next to the app, so the swap
   // stays on one volume, and verifies the unpacked bundle.
   @concurrent
-  private static func stage(
+  static func stage(
     _ release: Release, _ artifact: Artifact, in parent: URL, transport: Transport,
-    os: OSVersion, requirement: String
+    os: OSVersion, requirement: String,
+    unzip: @escaping @Sendable (URL, URL) async throws -> Void = {
+      try await Installer.unzip($0, into: $1)
+    },
+    verify: @escaping @Sendable (URL, Release, OSVersion, String) async throws -> Void = {
+      try await BundleCheck.verify(app: $0, release: $1, os: $2, requirement: $3)
+    }
   ) async throws -> Staged {
+    try Task.checkCancellation()
     let folder = try Installer.makeStagingFolder(in: parent, build: release.build)
     do {
       let zip = folder.appending(path: "update.zip")
       try await transport.download(artifact, to: zip)
-      try await Installer.unzip(zip, into: folder)
+      try Task.checkCancellation()
+      try await unzip(zip, folder)
       try FileManager.default.removeItem(at: zip)
+      try Task.checkCancellation()
       let app = folder.appending(path: "Baby.app", directoryHint: .isDirectory)
-      try await BundleCheck.verify(app: app, release: release, os: os, requirement: requirement)
+      try await verify(app, release, os, requirement)
+      try Task.checkCancellation()
       return Staged(release: release, folder: folder, app: app)
     } catch {
       Installer.remove(folder)
@@ -314,23 +324,34 @@ public final class Updater {
 
   // stage with timeLimit gives up, and cleans up, once the limit passes.
   @concurrent
-  private static func stage(
+  static func stage(
     _ release: Release, _ artifact: Artifact, in parent: URL, transport: Transport,
-    os: OSVersion, requirement: String, timeLimit: Duration
+    os: OSVersion, requirement: String, timeLimit: Duration,
+    unzip: @escaping @Sendable (URL, URL) async throws -> Void = {
+      try await Installer.unzip($0, into: $1)
+    }
   ) async throws -> Staged {
     try await withThrowingTaskGroup(of: Staged.self) { group in
       group.addTask {
         try await Self.stage(
           release, artifact, in: parent, transport: transport, os: os,
-          requirement: requirement)
+          requirement: requirement, unzip: unzip)
       }
       group.addTask {
         try await Task.sleep(for: timeLimit)
         throw CancellationError()
       }
       defer { group.cancelAll() }
-      guard let staged = try await group.next() else { throw CancellationError() }
-      return staged
+      do {
+        guard let staged = try await group.next() else { throw CancellationError() }
+        return staged
+      } catch {
+        group.cancelAll()
+        if let leftover = try? await group.next() {
+          Installer.remove(leftover.folder)
+        }
+        throw error
+      }
     }
   }
 
