@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import BabyUpdate
 
@@ -199,4 +200,68 @@ func cleanupDoesNotChangeSymlinkTargets(nested: Bool) throws {
   await #expect(throws: CocoaError.self) {
     try await Installer.unzip(zip, into: root)
   }
+}
+
+@Test func cancelsRunningUnzipAndAlreadyCancelledTask() async throws {
+  let root = try temporaryFolder()
+  defer { Installer.remove(root) }
+  let fifo = root.appending(path: "hang.zip")
+  try #require(mkfifo(fifo.path, 0o600) == 0)
+
+  // an already-cancelled task fails immediately without starting ditto
+  let preOut = try Installer.makeStagingFolder(in: root, build: 1)
+  let preCancelled = Task {
+    while !Task.isCancelled { await Task.yield() }
+    try await Installer.unzip(fifo, into: preOut)
+  }
+  preCancelled.cancel()
+  await #expect(throws: CancellationError.self) {
+    try await preCancelled.value
+  }
+
+  // cancelling while ditto is actively reading terminates the child process promptly
+  let out = try Installer.makeStagingFolder(in: root, build: 2)
+  let unzipTask = Task {
+    try await Installer.unzip(fifo, into: out)
+  }
+  defer { unzipTask.cancel() }
+
+  // opening the write end non-blocking succeeds once ditto has opened the FIFO for reading
+  var fd: Int32 = -1
+  let openDeadline = ContinuousClock.now + .seconds(5)
+  while ContinuousClock.now < openDeadline {
+    fd = open(fifo.path, O_WRONLY | O_NONBLOCK)
+    if fd >= 0 { break }
+    try #require(errno == ENXIO)
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  try #require(fd >= 0)
+
+  let writerFD = OSAllocatedUnfairLock<Int32?>(initialState: fd)
+  @Sendable func closeWriter() {
+    if let openFD = writerFD.withLock({ state -> Int32? in
+      let current = state
+      state = nil
+      return current
+    }) {
+      close(openFD)
+    }
+  }
+  let watchdog = Task {
+    try? await Task.sleep(for: .seconds(5))
+    closeWriter()
+  }
+  defer {
+    watchdog.cancel()
+    closeWriter()
+  }
+
+  let startedAt = ContinuousClock.now
+  unzipTask.cancel()
+  await #expect(throws: CancellationError.self) {
+    try await unzipTask.value
+  }
+  #expect(ContinuousClock.now - startedAt < .seconds(5))
+  // writerFD is still open, proving ditto was terminated by cancellation rather than EOF
+  #expect(writerFD.withLock { $0 != nil })
 }

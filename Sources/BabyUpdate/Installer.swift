@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// File-system steps of installing an update: staging folders next to the
 /// app, the atomic bundle swap, the relaunch waiter, and cleanup.
@@ -32,20 +33,90 @@ public enum Installer {
   /// Unpacks a ZIP made by `ditto -c -k --keepParent` into `folder`.
   @concurrent
   public static func unzip(_ zip: URL, into folder: URL) async throws {
+    try Task.checkCancellation()
     let process = Process()
     process.executableURL = URL(filePath: "/usr/bin/ditto")
     process.arguments = ["-x", "-k", zip.path, folder.path]
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
-    let status: Int32 = try await withCheckedThrowingContinuation { continuation in
-      process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-      do {
-        try process.run()
-      } catch {
-        process.terminationHandler = nil
-        continuation.resume(throwing: error)
-      }
+
+    struct State {
+      var process: Process?
+      var started = false
+      var cancelled = false
+      var continuation: CheckedContinuation<Int32, any Error>?
     }
+
+    let state = OSAllocatedUnfairLock(uncheckedState: State(process: process))
+    let status: Int32 = try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        let shouldRun = state.withLockUnchecked { state -> Bool in
+          if state.cancelled {
+            state.process = nil
+            return false
+          }
+          state.continuation = continuation
+          return true
+        }
+        guard shouldRun else {
+          continuation.resume(throwing: CancellationError())
+          return
+        }
+
+        process.terminationHandler = { finished in
+          let completion = state.withLockUnchecked {
+            state -> (CheckedContinuation<Int32, any Error>, Bool)? in
+            guard let continuation = state.continuation else { return nil }
+            state.continuation = nil
+            state.process = nil
+            return (continuation, state.cancelled)
+          }
+          guard let (continuation, cancelled) = completion else { return }
+          if cancelled {
+            continuation.resume(throwing: CancellationError())
+          } else {
+            continuation.resume(returning: finished.terminationStatus)
+          }
+        }
+
+        do {
+          try process.run()
+        } catch {
+          process.terminationHandler = nil
+          let completion = state.withLockUnchecked {
+            state -> (CheckedContinuation<Int32, any Error>, Bool)? in
+            guard let continuation = state.continuation else { return nil }
+            state.continuation = nil
+            state.process = nil
+            return (continuation, state.cancelled)
+          }
+          if let (continuation, cancelled) = completion {
+            continuation.resume(throwing: cancelled ? CancellationError() : error)
+          }
+          return
+        }
+
+        let processToTerminate = state.withLockUnchecked { state -> Process? in
+          state.started = true
+          guard state.cancelled, state.continuation != nil else { return nil }
+          let proc = state.process
+          state.process = nil
+          return proc
+        }
+        processToTerminate?.terminate()
+      }
+    } onCancel: {
+      let processToTerminate = state.withLockUnchecked { state -> Process? in
+        state.cancelled = true
+        guard state.started, state.continuation != nil else { return nil }
+        let proc = state.process
+        state.process = nil
+        return proc
+      }
+      processToTerminate?.terminate()
+    }
+
+    try Task.checkCancellation()
     guard status == 0 else {
       throw CocoaError(
         .fileReadCorruptFile,

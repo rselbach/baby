@@ -706,3 +706,167 @@ func keepsRecoveryMarkerUntilUpdatedBuildLaunches(restart: Bool) async throws {
   #expect(calls.withLock { $0 } == 2)
   #expect(defaults.object(forKey: "lastUpdateCheck") as? Date == nextDay)
 }
+
+@Test func cancelsStagingOnTimeoutAndBetweenStepsAndCleansUpStagingFolder() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appending(path: "updater-cancel-\(UUID())", directoryHint: .isDirectory)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { Installer.remove(root) }
+
+  let next = try packageRelease(in: root, version: "1.1.0", build: 2)
+  let artifact = try #require(next.release.artifacts.first)
+
+  func stagingFolders(in dir: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+      .filter { $0.lastPathComponent.hasPrefix(Installer.stagingPrefix) }
+  }
+
+  // Case 1: timeLimit cancels a running ditto process and cleans up the staging folder
+  do {
+    let dir = root.appending(path: "timeout-unzip", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let fifo = root.appending(path: "stage-hang.zip")
+    try #require(mkfifo(fifo.path, 0o600) == 0)
+
+    let token = "updater-stage-timeout-\(UUID())"
+    defer { MockURLProtocol.unregister(token) }
+    let transport = makeMockTransport(token) { _ in .init(body: next.zip) }
+
+    let writerState = OSAllocatedUnfairLock<(opened: Bool, closed: Bool, fd: Int32?)>(
+      initialState: (false, false, nil))
+    @Sendable func closeWriter() {
+      if let openFD = writerState.withLock({ state -> Int32? in
+        state.closed = true
+        let current = state.fd
+        state.fd = nil
+        return current
+      }) {
+        close(openFD)
+      }
+    }
+
+    // confirm ditto actually opened the FIFO for reading, and keep the write end
+    // open until stage returns (or a watchdog releases it if cancellation regresses)
+    let probe = Task {
+      while !Task.isCancelled {
+        let fd = open(fifo.path, O_WRONLY | O_NONBLOCK)
+        if fd >= 0 {
+          let closeImmediately = writerState.withLock { state -> Bool in
+            state.opened = true
+            if state.closed { return true }
+            state.fd = fd
+            return false
+          }
+          if closeImmediately { close(fd) }
+          return
+        }
+        if errno != ENXIO { return }
+        try? await Task.sleep(for: .milliseconds(10))
+      }
+    }
+    let watchdog = Task {
+      try? await Task.sleep(for: .seconds(5))
+      closeWriter()
+    }
+    defer {
+      probe.cancel()
+      watchdog.cancel()
+      closeWriter()
+    }
+
+    let startedAt = ContinuousClock.now
+    await #expect(throws: CancellationError.self) {
+      _ = try await Updater.stage(
+        next.release, artifact, in: dir, transport: transport, os: OSVersion("14.5")!,
+        requirement: adHocRequirement, timeLimit: .seconds(1),
+        unzip: { _, folder in
+          try await Installer.unzip(fifo, into: folder)
+        })
+    }
+    #expect(ContinuousClock.now - startedAt < .seconds(5))
+    let state = writerState.withLock { $0 }
+    #expect(state.opened)
+    // write end is still open, proving ditto was terminated by timeLimit rather than EOF
+    #expect(!state.closed && state.fd != nil)
+    #expect(try stagingFolders(in: dir).isEmpty)
+  }
+
+  // Case 2: cancellation observed right after unzip skips verification and cleans up
+  do {
+    let dir = root.appending(path: "cancel-before-verify", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let token = "updater-stage-post-unzip-\(UUID())"
+    defer { MockURLProtocol.unregister(token) }
+    let transport = makeMockTransport(token) { _ in .init(body: next.zip) }
+
+    let verifyCalled = OSAllocatedUnfairLock(initialState: false)
+    let unzipEntered = AsyncStream<Void>.makeStream()
+    let allowUnzipReturn = AsyncStream<Void>.makeStream()
+
+    let stageTask = Task {
+      defer { unzipEntered.continuation.finish() }
+      return try await Updater.stage(
+        next.release, artifact, in: dir, transport: transport, os: OSVersion("14.5")!,
+        requirement: adHocRequirement,
+        unzip: { zip, folder in
+          try await Installer.unzip(zip, into: folder)
+          unzipEntered.continuation.yield()
+          for await _ in allowUnzipReturn.stream { break }
+        },
+        verify: { _, _, _, _ in
+          verifyCalled.withLock { $0 = true }
+        })
+    }
+    var entered = false
+    for await _ in unzipEntered.stream {
+      entered = true
+      break
+    }
+    stageTask.cancel()
+    allowUnzipReturn.continuation.yield()
+
+    await #expect(throws: CancellationError.self) {
+      _ = try await stageTask.value
+    }
+    #expect(entered)
+    #expect(!verifyCalled.withLock { $0 })
+    #expect(try stagingFolders(in: dir).isEmpty)
+  }
+
+  // Case 3: cancellation during verification still removes the staging folder
+  do {
+    let dir = root.appending(path: "cancel-during-verify", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let token = "updater-stage-during-verify-\(UUID())"
+    defer { MockURLProtocol.unregister(token) }
+    let transport = makeMockTransport(token) { _ in .init(body: next.zip) }
+
+    let verifyEntered = AsyncStream<Void>.makeStream()
+    let allowVerifyReturn = AsyncStream<Void>.makeStream()
+
+    let stageTask = Task {
+      defer { verifyEntered.continuation.finish() }
+      return try await Updater.stage(
+        next.release, artifact, in: dir, transport: transport, os: OSVersion("14.5")!,
+        requirement: adHocRequirement,
+        verify: { app, release, os, requirement in
+          try await BundleCheck.verify(app: app, release: release, os: os, requirement: requirement)
+          verifyEntered.continuation.yield()
+          for await _ in allowVerifyReturn.stream { break }
+        })
+    }
+    var entered = false
+    for await _ in verifyEntered.stream {
+      entered = true
+      break
+    }
+    stageTask.cancel()
+    allowVerifyReturn.continuation.yield()
+
+    await #expect(throws: CancellationError.self) {
+      _ = try await stageTask.value
+    }
+    #expect(entered)
+    #expect(try stagingFolders(in: dir).isEmpty)
+  }
+}
