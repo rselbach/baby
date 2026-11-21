@@ -311,3 +311,53 @@ private let launch = Date(timeIntervalSince1970: 1_800_000_000)
   _ = try Feed.open(feed, publicKey: key.publicKey)
   _ = try Feed.open(feed, publicKey: dedicated.publicKey)
 }
+
+@Test func refreshReSignsFreshLegacyFeedToAddRotatedKey() throws {
+  let base = release()
+  let dedicated = Curve25519.Signing.PrivateKey()
+  let (live, published) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKey: key, publicKey: key.publicKey, now: launch)
+
+  let soon = launch.addingTimeInterval(Feed.validity - Feed.refreshMargin - 60)
+  let (refreshed, renewed) = try Feed.refresh(
+    live, privateKeys: [key, dedicated],
+    publicKeys: [key.publicKey, dedicated.publicKey], now: soon)
+  #expect(refreshed != live)
+  #expect(renewed == published)
+  #expect(try Feed.open(refreshed, publicKey: key.publicKey) == published)
+  #expect(try Feed.open(refreshed, publicKey: dedicated.publicKey) == published)
+  try renewed.verifySupersedes(published)
+
+  // once all required signatures are present, a fresh feed is reused verbatim
+  let (again, againRelease) = try Feed.refresh(
+    refreshed, privateKeys: [key, dedicated],
+    publicKeys: [key.publicKey, dedicated.publicKey], now: soon)
+  #expect(again == refreshed)
+  #expect(againRelease == published)
+}
+
+@Test func publishRerunReSignsFreshLegacyFeedToAddRotatedKey() throws {
+  let base = release()
+  let dedicated = Curve25519.Signing.PrivateKey()
+  let (live, published) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKey: key, publicKey: key.publicKey, now: launch)
+
+  let soon = launch.addingTimeInterval(Feed.validity - Feed.refreshMargin - 60)
+  let (rerun, rerunRelease) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKeys: [key, dedicated], after: live,
+    publicKeys: [key.publicKey, dedicated.publicKey], now: soon)
+  #expect(rerun != live)
+  #expect(rerunRelease == published)
+  #expect(try Feed.open(rerun, publicKey: key.publicKey) == published)
+  #expect(try Feed.open(rerun, publicKey: dedicated.publicKey) == published)
+  try rerunRelease.verifySupersedes(published)
+
+  let (again, _) = try Feed.publish(
+    version: base.version, build: base.build, notesURL: base.notesURL,
+    artifacts: base.artifacts, privateKeys: [key, dedicated], after: rerun,
+    publicKeys: [key.publicKey, dedicated.publicKey], now: soon)
+  #expect(again == rerun)
+}
