@@ -133,6 +133,27 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ steps.version.outputs.build }}
         run: |
+          mount_dir=""
+          # keeps the failing status on macOS's bash 3.2
+          cleanup() {
+            local rc=$?
+            if [[ -n "${mount_dir}" ]]; then
+              hdiutil detach "${mount_dir}" >/dev/null 2>&1 \
+                || hdiutil detach -force "${mount_dir}" >/dev/null 2>&1 || true
+              rmdir "${mount_dir}" 2>/dev/null || true
+            fi
+            exit "${rc}"
+          }
+          trap cleanup EXIT
+
+          verify_app() {
+            local app="$1"
+            build/baby-update-tool verify-app "${app}" \
+              --version "${VERSION}" --build "${BUILD}"
+            xcrun stapler validate "${app}"
+            spctl --assess --type execute --verbose=2 "${app}"
+          }
+
           swift build -c release --product baby-update-tool
           bin_dir="$(swift build -c release --show-bin-path)"
           mkdir -p build
@@ -150,19 +171,30 @@ jobs:
             unpacked="${RUNNER_TEMP}/existing-unpacked"
             mkdir -p "${unpacked}"
             ditto -x -k "${existing_dir}/${zip}" "${unpacked}"
-            build/baby-update-tool verify-app "${unpacked}/Baby.app" \
-              --version "${VERSION}" --build "${BUILD}"
-            xcrun stapler validate "${unpacked}/Baby.app"
-            spctl --assess --type execute --verbose=2 "${unpacked}/Baby.app"
+            verify_app "${unpacked}/Baby.app"
             rm -rf "${unpacked}"
             has_zip="true"
           fi
 
           has_dmg="false"
           if [[ -f "${existing_dir}/${dmg}" ]]; then
-            codesign --verify --strict "${existing_dir}/${dmg}"
+            dmg_requirement='anchor apple generic'
+            dmg_requirement+=' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+            dmg_requirement+=' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+            dmg_requirement+=' and certificate leaf[subject.OU] = "LS8YD2TR79"'
+            dmg_requirement+=' and notarized'
+            codesign --verify --strict "-R=${dmg_requirement}" \
+              "${existing_dir}/${dmg}"
             xcrun stapler validate "${existing_dir}/${dmg}"
             hdiutil verify "${existing_dir}/${dmg}"
+            mount_dir="$(mktemp -d "${RUNNER_TEMP}/existing-dmg.XXXXXX")"
+            hdiutil attach -nobrowse -readonly -mountpoint "${mount_dir}" \
+              "${existing_dir}/${dmg}" </dev/null >/dev/null
+            verify_app "${mount_dir}/Baby.app"
+            hdiutil detach "${mount_dir}" >/dev/null 2>&1 \
+              || hdiutil detach -force "${mount_dir}" >/dev/null
+            rmdir "${mount_dir}"
+            mount_dir=""
             has_dmg="true"
           fi
 
@@ -217,6 +249,10 @@ jobs:
           EXISTING_DMG: ${{ steps.existing.outputs.dmg_path }}
         run: |
           ./release.sh
+          # on a partial-upload rerun where only one asset was published, keep
+          # the already-verified asset because overwrite_files is false; the
+          # missing asset is freshly signed for the same tag, so ZIP and DMG
+          # may carry different Baby.app signing timestamps
           if [[ "${HAS_EXISTING_ZIP}" == "true" ]]; then
             cp "${EXISTING_ZIP}" "build/Baby-${VERSION}-macos-arm64.zip"
           fi
